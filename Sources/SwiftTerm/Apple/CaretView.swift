@@ -5,6 +5,8 @@
 //  Created by Miguel de Icaza on 4/16/23.
 //
 
+#if !SWIFTTERM_EMBEDDED
+#if os(macOS) || os(iOS) || os(visionOS)
 import Foundation
 import CoreText
 
@@ -17,17 +19,19 @@ extension CaretView {
             return
         }
         context.saveGState()
+        defer { context.restoreGState() }
         context.clip(to: [bounds])
         context.setFillColor(TTColor.clear.cgColor)
         context.fill ([bounds])
+        let cursorColor = renderCursorColor
         
         if !hasFocus {
-            context.setStrokeColor(bgColor)
+            context.setStrokeColor(cursorColor.cgColor)
             context.setLineWidth(3)
             context.stroke(bounds)
             return
         }
-        context.setFillColor(bgColor)
+        context.setFillColor(cursorColor.cgColor)
         let region: CGRect
         switch style {
         case .blinkBar, .steadyBar:
@@ -39,30 +43,100 @@ extension CaretView {
         }
         context.fill([region])
 
-        let lineDescent = CTFontGetDescent(terminal.fontSet.normal)
-        let lineLeading = CTFontGetLeading(terminal.fontSet.normal)
-        let yOffset = ceil(lineDescent+lineLeading)
+        let normalFont = renderNormalFont ?? terminal.fontSet.normal
+        // Must be the offset the text renderers use, or the glyph drawn inside
+        // the caret lands on a different baseline than the row under it.
+        let terminalCell: TerminalView.CellDimension? = terminal.cellDimension
+        let yOffset = CellGeometry.baselineOffset(
+            normalFont: normalFont, cellHeight: terminalCell?.height ?? bounds.height)
         
         guard style == .steadyBlock || style  == .blinkBlock else {
             return
         }
-        let caretFG = caretTextColor ?? terminal.nativeForegroundColor
+        let caretFG = renderTextColor
         context.setFillColor(caretFG.cgColor)
+        if let powerlineCodePoint,
+           PowerlineRenderer.shouldRender(codePoint: powerlineCodePoint,
+                                          customGlyphsEnabled: renderCustomBlockGlyphs) {
+            let caretScale = terminal.backingScaleFactor()
+#if os(macOS)
+            let underlineThickness = normalFont.underlineThickness
+#else
+            let underlineThickness: CGFloat = 0.63
+#endif
+            let minThicknessPx = max(1, Int(round(caretScale)))
+            let lineWidthPx = max(minThicknessPx,
+                                  Int(round(caretScale * underlineThickness * 1.35)))
+            PowerlineRenderer.drawCaret(codePoint: powerlineCodePoint,
+                                        in: context,
+                                        bounds: bounds,
+                                        renderMode: powerlineRenderMode,
+                                        scale: caretScale,
+                                        color: caretFG.cgColor,
+                                        lineWidthPx: lineWidthPx)
+            return
+        }
         for run in CTLineGetGlyphRuns(ctline) as? [CTRun] ?? [] {
             let runGlyphsCount = CTRunGetGlyphCount(run)
             let runAttributes = CTRunGetAttributes(run) as? [NSAttributedString.Key: Any] ?? [:]
-            let runFont = runAttributes[.font] as! TTFont
+            let runFont = (runAttributes[.font] as? TTFont) ?? normalFont
+            let ctRunFont = runFont as CTFont
 
             let runGlyphs = [CGGlyph](unsafeUninitializedCapacity: runGlyphsCount) { (bufferPointer, count) in
                 CTRunGetGlyphs(run, CFRange(), bufferPointer.baseAddress!)
                 count = runGlyphsCount
             }
 
-            var positions = runGlyphs.enumerated().map { (i: Int, glyph: CGGlyph) -> CGPoint in
-                CGPoint(x: 0, y: yOffset)
+            // Center full-width (CJK) glyphs within the caret the same way as the
+            // surrounding text so the character doesn't shift under the cursor,
+            // and scale an oversized glyph down to match (drawTerminalContents
+            // does the same via CTFontCreateCopyWithAttributes). The caret bounds
+            // span `glyphColumnWidth` cells, so the centered glyph isn't clipped.
+            let glyphPolicy = runAttributes[SwiftTermGlyphPolicyKey] as? TerminalGlyphPlacementPolicy
+            // A lone fallback glyph in a single cell is fitted like the row
+            // renderers do; see `fallbackGlyphFit`.
+            let fitsFallbackGlyph = glyphPolicy == nil && glyphColumnWidth == 1
+                && CTLineGetGlyphCount(ctline) == 1 && !terminal.isPrimaryFont(ctRunFont)
+            let fits = runGlyphs.map { glyph in
+                if let glyphPolicy {
+                    return terminal.glyphSlotFit(font: ctRunFont, glyph: glyph,
+                                                 columnWidth: glyphColumnWidth,
+                                                 policy: glyphPolicy)
+                }
+                if fitsFallbackGlyph {
+                    return terminal.fallbackGlyphFit(font: ctRunFont, glyph: glyph)
+                }
+                return terminal.glyphSlotFit(font: ctRunFont, glyph: glyph, columnWidth: glyphColumnWidth)
             }
-            CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+            var positions = fits.map {
+                CellGeometry.pixelAlignedGlyphOrigin(CGPoint(x: $0.dx, y: yOffset + $0.dy), in: context)
+            }
+            if fits.contains(where: { $0.scaleX != 1 || $0.scaleY != 1 }) {
+                for i in 0..<runGlyphsCount {
+                    let fit = fits[i]
+                    var g = runGlyphs[i]
+                    var p = positions[i]
+                    if fit.isUniform {
+                        let s = fit.scale
+                        let drawFont: CTFont = s == 1
+                            ? ctRunFont
+                            : CTFontCreateCopyWithAttributes(ctRunFont, CTFontGetSize(ctRunFont) * s, nil, nil)
+                        CTFontDrawGlyphs(drawFont, &g, &p, 1, context)
+                    } else {
+                        context.saveGState()
+                        context.translateBy(x: p.x, y: p.y)
+                        context.scaleBy(x: fit.scaleX, y: fit.scaleY)
+                        var origin = CGPoint.zero
+                        CTFontDrawGlyphs(ctRunFont, &g, &origin, 1, context)
+                        context.restoreGState()
+                    }
+                }
+            } else {
+                CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+            }
         }
-        context.restoreGState()
     }
 }
+
+#endif
+#endif // !SWIFTTERM_EMBEDDED

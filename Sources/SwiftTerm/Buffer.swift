@@ -6,7 +6,9 @@
 //  Copyright © 2019 Miguel de Icaza. All rights reserved.
 //
 
+#if !SWIFTTERM_EMBEDDED
 import Foundation
+#endif
 
 /**
  * The buffer represents the contents shown to the user.
@@ -16,16 +18,57 @@ import Foundation
  *
  * Some of the saved state information is also tracked here.
  */
+/// A one-field box that lets other objects reach a ``Buffer`` without forming a
+/// `weak` reference to it.
+///
+/// `weak` is what moves an object onto the Swift runtime's side-table refcount
+/// path, and that transition is one-way: from then on every retain and release
+/// of the buffer costs roughly 9x what an inline refcount does. `Buffer` is
+/// retained and released continuously by the parse loop, so the tax is paid in
+/// the hottest place we have. Routing the back-references through a box keeps
+/// the buffer itself on the fast path — nothing points at it weakly, and the
+/// box, which is what the weak-style lifetime question is really about, is
+/// never touched in a hot path.
+///
+/// Both the buffer and its lines hold the box strongly. ``Buffer/deinit``
+/// clears ``buffer``, so a reader that outlives the buffer sees nil rather than
+/// a dangling pointer.
+final class BufferRef {
+#if SWIFTTERM_EMBEDDED
+    var buffer: Buffer?
+#else
+    unowned(unsafe) var buffer: Buffer?
+#endif
+    init (_ buffer: Buffer) { self.buffer = buffer }
+}
+
 public final class Buffer {
-    private var _lines: CircularBufferLineList
+    private let _lines: CircularBufferLineList
+    /// Identifier space shared by every packed cell in this buffer.
+    let cellArena: CellArena
+
+    /// The box handed to lines and to the line list so they can reach back here.
+    /// Implicitly unwrapped because it can only be built once `self` exists.
+    private(set) var selfRef: BufferRef! = nil
     var xDisp, _yDisp, xBase: Int
     private var _x, _y, _yBase: Int
     private var _linesWithImagesCount: Int = 0
     
     // this keeps incrementing even as we run out of space in _lines and trim out
     // old lines.
-    var linesTop: Int 
-    
+    var linesTop: Int
+
+    /// Monotonic count of lines that have been trimmed off the top of the
+    /// scrollback since this buffer was created or reset. Increments by one
+    /// each time output pushes a line out of a full scrollback buffer
+    /// (`Terminal.scroll`); resets to zero on hard reset (RIS) and buffer
+    /// (re)construction. Embedders can use this to anchor a scrolled-up
+    /// viewport by absolute buffer line rather than pixel offset: at the
+    /// scrollback cap the content height stays constant while rows shift,
+    /// so a pixel-based anchor drifts by one row per trimmed line.
+    public var totalLinesTrimmed: Int { linesTop }
+
+
     /// This is the index into the `lines` array that corresponds to the top row of displayed
     /// content in the terminal when the scroll is zero.   So the terminal contents that the application
     /// has access to are `lines [yBase..(yBase+rows)]`
@@ -49,7 +92,7 @@ public final class Buffer {
         set {
             if _yDisp < 0 {
                 #if DEBUG
-                abort()
+                fatalError("yDisp must not be negative")
                 #else
                 return
                 #endif
@@ -58,41 +101,58 @@ public final class Buffer {
         }
     }
     /**
-     * This is the cursor column 0-based, due to the way that the terminal must behave, buffer.x sometimes can
-     * be beyond the boundary of the buffer, so it is important that any writes to a line with [buffer.x] first
-     * does so by clamping the value to cols-1.
+     * The cursor column, 0-based. It is always a valid column: `0 ..< cols`.
      *
+     * After a write to the last column of the line (or of the right margin),
+     * the cursor stays on that column and the next printed character wraps
+     * first. That state is not visible in `x`; the terminal keeps it in an
+     * internal pending-wrap flag, as xterm (`do_wrap`) does.
+     *
+     * Setting `x` moves the cursor, and a cursor move cancels a pending wrap.
      */
     public var x: Int {
         get { return _x }
         set(newValue) {
             if newValue < 0 {
                 #if DEBUG
-                abort()
+                fatalError("x must not be negative")
                 #else
                 return
                 #endif
             }
+            #if DEBUG
+            if newValue >= _cols {
+                fatalError("x must be less than cols")
+            }
+            #endif
             _x = newValue
+            pendingWrap = false
         }
     }
     
     /**
-     * This is the cursor row 0-based
+     * This is the cursor row 0-based. Setting it moves the cursor, and a
+     * cursor move cancels a pending wrap (see ``x``).
      */
     public var y: Int {
         get { return _y }
         set(newValue) {
             if newValue < 0 {
                 #if DEBUG
-                abort()
+                fatalError("y must not be negative")
                 #else
                 return
                 #endif
             }
             _y = newValue
+            pendingWrap = false
         }
     }
+
+    /// The cursor column with a pending wrap counted as one more column: the
+    /// number of cells before the cursor on its row. Code that measures text
+    /// up to the cursor uses it; code that addresses a cell uses ``x``.
+    var columnsBeforeCursor: Int { pendingWrap ? _x + 1 : _x }
     
     private var _scrollBottom: Int
     /**
@@ -103,7 +163,7 @@ public final class Buffer {
         set {
             if newValue < 0 {
                 #if DEBUG
-                abort()
+                fatalError("scrollBottom must not be negative")
                 #else
                 return
                 #endif
@@ -143,10 +203,11 @@ public final class Buffer {
     var savedOriginMode: Bool = false
     /// Saved state for the origin mode
     var savedMarginMode: Bool = false
-    /// Saved state for the wrap around mode
-    var savedWraparound: Bool = false
-    /// Saved state for the reverse wrap around mode
-    var savedReverseWraparound: Bool = false
+    /// The DECSCA or SPA protection saved by DECSC.
+    var savedCharacterProtection: Bool = false
+    /// The pending-wrap flag saved by DECSC (xterm `wrap_flag`). This field
+    /// uses padding after the previous one, so no other field moves.
+    var savedPendingWrap: Bool = false
 
     /**
      * The left margin, 0-indexed, used when marginMode is turned on
@@ -198,8 +259,10 @@ public final class Buffer {
     
     var scrollback: Int?
     
+    /// Yields the line list without creating an owned result. Hot scroll paths
+    /// borrow the list for the duration of one operation.
     var lines : CircularBufferLineList {
-        get { return _lines }
+        _read { yield _lines }
     }
 
     /// Returns true if any lines in this buffer have images attached
@@ -226,6 +289,14 @@ public final class Buffer {
         }
     }
 
+    /// Removes inline images that normal terminal output replaces.
+    /// Kitty placements are stored independently in the terminal core.
+    func clearTextOverwrittenImagesFromLine(_ line: BufferLine) {
+        guard line.images != nil else { return }
+        _linesWithImagesCount -= 1
+        line.images = nil
+    }
+
     /// Recalculates the count of lines with images (used after reflow operations)
     func recalculateLinesWithImagesCount() {
         var count = 0
@@ -237,29 +308,455 @@ public final class Buffer {
         _linesWithImagesCount = count
     }
 
+    /// Points the line list back at this buffer. Replaces the four closures the
+    /// list used to hold; see ``CircularBufferLineList/owner`` for why.
     private func setupLinesCallbacks() {
-        _lines.onLineRecycled = { [weak self] hadImages in
-            if hadImages {
-                self?._linesWithImagesCount -= 1
-            }
-        }
-        _lines.onLinePushed = { [weak self] hasImages in
-            if hasImages {
-                self?._linesWithImagesCount += 1
-            }
+        _lines.owner = self
+        _lines.isLive = true
+    }
+
+    /// A line is about to be recycled; `hadImages` reports whether it carried any.
+    func lineWillRecycle (hadImages: Bool) {
+        if hadImages {
+            _linesWithImagesCount -= 1
         }
     }
+
+    /// A line was pushed onto the list; `hasImages` reports whether it carries any.
+    func lineDidPush (hasImages: Bool) {
+        if hasImages {
+            _linesWithImagesCount += 1
+        }
+    }
+
+    /// Stamp the owner at attach time (B.3): a clone never inherits a
+    /// cross-buffer template's owner, so it is assigned here, when the line
+    /// actually becomes a member of this buffer.
+    func lineAttached (_ line: BufferLine) {
+        line.adoptArena(cellArena)
+        line.owningBufferRef = selfRef
+    }
     
-    private var curAttr: Attribute = Attribute.empty
     private var insertMode: Bool = false
+    /// Whether new cells are protected (DECSCA 1 or SPA).
+    private var characterProtection: Bool = false
+    /// `insertMode || characterProtection`, kept by the setters so that the
+    /// bulk-insert guard reads one field.
+    private var bulkInsertBlocked: Bool = false
     private var marginMode: Bool = false
     private var wraparound: Bool = false
-    var scroll: (_ isWrapped: Bool)->() = { x in
-        fatalError("This should be set after creating a buffer")
+
+    // OSC 133 state belongs to a buffer so switching to the alternate screen
+    // cannot leak an in-progress shell prompt into the normal screen.
+
+    /// The classification new cells receive as they are written, as most
+    /// recently declared by the shell.
+    var semanticContent: SemanticContent = .none
+    /// The input lifetime state machine (R4).
+    var semanticInput: SemanticInputState = .idle
+    var semanticClickMode: SemanticPromptClickMode = .none
+    var semanticUsesSpecialCursorKeys = false
+
+    /// Set when a write fills the last column of the line or of the right
+    /// margin: the cursor stays on that column (`x`) and the next printed
+    /// character wraps first (with DECAWM set) or overwrites it (with DECAWM
+    /// reset). This is xterm's `do_wrap` and Ghostty's `pending_wrap`.
+    ///
+    /// The print functions set it; a cursor move through ``x`` or ``y``
+    /// clears it. Operations that clear it without a cursor move (erase,
+    /// insert, delete) clear it explicitly. It is not public.
+    ///
+    /// It uses padding after the previous field, so no other field of this
+    /// hot class moves (see the layout note in the pending-wrap work order).
+    var pendingWrap: Bool = false
+
+    // The origin is the line object carrying the active group's primary
+    // mark, plus a cached row index. No scroll, splice, margin, trim, or
+    // reflow path knows this cache exists: the read path revalidates with
+    // one pointer compare and rescans outward when the line moved.
+    private var semanticPromptStartLine: BufferLine?
+    private var semanticPromptStartRowCache = 0
+    private(set) var semanticPromptRowScanCount = 0
+#if DEBUG
+    /// Row visits during prompt checks, including backward chain traversal.
+    /// Access under the terminal lock, as with the buffer state.
+    private(set) var testingSemanticPromptRowVisits = 0
+#endif
+
+    // A monotonic prompt-group counter. `beginSemanticPromptGroup` advances it;
+    // the group-opening mark and every hard-continuation line of the group are
+    // stamped with the current value, and R5 derivation follows a hard link
+    // only when the epochs agree — that is what isolates a new prompt from an
+    // old group's stranded continuation rows.
+    private var semanticGroupCounter: UInt64 = 0
+    private(set) var activeSemanticGroupID: UInt64 = 0
+
+    var semanticPromptStartRow: Int? {
+        guard let startLine = semanticPromptStartLine else { return nil }
+        if semanticPromptStartRowCache >= 0, semanticPromptStartRowCache < lines.count,
+           lines[semanticPromptStartRowCache] === startLine,
+           lineCarriesOriginMark(startLine) {
+            return semanticPromptStartRowCache
+        }
+        semanticPromptRowScanCount += 1
+        let near = semanticPromptStartRowCache
+        if let row = findRow(near: near, where: { $0 === startLine }),
+           lineCarriesOriginMark(startLine) {
+            semanticPromptStartRowCache = row
+            return row
+        }
+        // A margin copy can move the mark away from its line object. Re-bind
+        // to the most recent group opening at or above the cursor. The
+        // below-cursor fallback only covers transient scroll states.
+        if let row = findSemanticPromptRebindRow() {
+            semanticPromptStartLine = lines[row]
+            semanticPromptStartRowCache = row
+            return row
+        }
+        semanticPromptStartLine = nil
+        return nil
     }
-    
+
+    // R3: re-bind to the most recent group-opening mark at or above the
+    // cursor. The scan is row-major (nearest row wins, either kind) so a
+    // dead group deeper in the history never beats a nearer live one — a
+    // kind-major scan would let an `initial` in scrollback outrank a closer
+    // secondary-anchored group. The below-cursor fallback only covers the
+    // transient window mid-scroll before the cursor catches up.
+    private func findSemanticPromptRebindRow() -> Int? {
+        guard !lines.isEmpty else { return nil }
+        let cursorRow = min(max(yBase + y, 0), lines.count - 1)
+
+        for row in stride(from: cursorRow, through: 0, by: -1)
+        where rowHasGroupOpeningMark(row) {
+            return row
+        }
+
+        guard cursorRow + 1 < lines.count else { return nil }
+        for row in stride(from: cursorRow + 1, through: lines.count - 1, by: 1)
+        where rowHasGroupOpeningMark(row) {
+            return row
+        }
+        return nil
+    }
+
+    // E.1 single authority: the rebind only accepts the ACTIVE group's opening
+    // mark, so it can never attach the origin to a dead group's mark. If the
+    // live origin's line is gone and no active-group opening mark remains, the
+    // origin resolves to nil and clicks are refused rather than routed against
+    // a dead prompt.
+    private func rowHasGroupOpeningMark(_ row: Int) -> Bool {
+        lines[row].semanticMarks.contains {
+            ($0.kind == .initial || $0.kind == .secondary) && $0.group == activeSemanticGroupID
+        }
+    }
+
+    private func lineCarriesOriginMark(_ line: BufferLine) -> Bool {
+        line.semanticMarks.contains { $0.kind == .initial || $0.kind == .secondary }
+    }
+
+    /// Scans for a line, radiating outward from `near`: scrolls move the
+    /// origin by small deltas, so the match is usually adjacent.
+    private func findRow(near: Int, where predicate: (BufferLine) -> Bool) -> Int? {
+        let count = lines.count
+        guard count > 0 else { return nil }
+        let anchor = min(max(near, 0), count - 1)
+        var below = anchor
+        var above = anchor + 1
+        while below >= 0 || above < count {
+            if below >= 0 {
+                if predicate(lines[below]) {
+                    return below
+                }
+                below -= 1
+            }
+            if above < count {
+                if predicate(lines[above]) {
+                    return above
+                }
+                above += 1
+            }
+        }
+        return nil
+    }
+
+    var hasSemanticPromptGroup: Bool {
+        semanticPromptStartRow != nil
+    }
+
+    func beginSemanticPromptGroup(originRow row: Int) {
+        guard row >= 0, row < lines.count else { return }
+        semanticGroupCounter &+= 1
+        if semanticGroupCounter == 0 { semanticGroupCounter = 1 }
+        activeSemanticGroupID = semanticGroupCounter
+        semanticPromptStartLine = lines[row]
+        semanticPromptStartRowCache = row
+    }
+
+    /// R2 reuse rule for `A`/`P;k=i`: reuse the active group only when the
+    /// interaction state is prompt or armed, the target row is the resolved
+    /// origin **line object** (identity, never the numeric row), and that line
+    /// carries the active group's opening mark. Otherwise a new group must be
+    /// allocated (a repaint reuses; `D A`, `N B`, and a recycled row do not).
+    func canReuseSemanticGroup(atRow row: Int) -> Bool {
+        guard semanticInput == .prompt || semanticInput == .armed else { return false }
+        guard row >= 0, row < lines.count else { return false }
+        guard let originRow = semanticPromptStartRow,
+              lines[originRow] === lines[row] else {
+            return false
+        }
+        // F.1: the same opening-mark predicate the rebind uses, so reuse and
+        // rebind-refusal can never desynchronize.
+        return rowHasGroupOpeningMark(row)
+    }
+
+    func clearSemanticPromptGroup() {
+        semanticPromptStartLine = nil
+    }
+
+    /// The live origin as (line, kind, column), read directly from the
+    /// tracked origin line without triggering a rebind. `copyFrom` calls this
+    /// mid-scroll, so it must not scan or mutate.
+    func rawSemanticOrigin() -> (line: BufferLine, kind: SemanticPromptKind, column: Int)? {
+        guard let line = semanticPromptStartLine else { return nil }
+        if let mark = line.semanticMarks.first(where: { $0.kind == .initial }) {
+            return (line, .initial, mark.column)
+        }
+        if let mark = line.semanticMarks.first(where: { $0.kind == .secondary }) {
+            return (line, .secondary, mark.column)
+        }
+        return nil
+    }
+
+    /// Follows the origin's cells to the line they were copied onto. The row
+    /// cache is left to re-resolve lazily on the next read.
+    func reassignSemanticOrigin(to line: BufferLine) {
+        semanticPromptStartLine = line
+    }
+
+    /// Drops `.input`/`.prompt` cell tags from a line being absorbed into a
+    /// different (active) group, so a dead group's leftover cells cannot skew
+    /// the active group's offset walk (E.4).
+    func clearStaleSemanticCells(on line: BufferLine) {
+        for col in 0..<line.count {
+            let cell = line.packedCell(at: col)
+            if cell.semanticContentCode >= 1 && cell.semanticContentCode <= 5 {
+                line.setPackedCell(cell.replacingSemanticContentCode(0), at: col)
+            }
+        }
+    }
+
+    /// The current absolute row of a line, by identity, or nil if it has
+    /// been trimmed or recycled away. Hosts can use this to re-resolve a
+    /// stored target after scrollback has shifted row indexes. Reuses the one
+    /// identity-scan implementation, hinted near the origin cache (E.5).
+    func absoluteRow(of line: BufferLine) -> Int? {
+        findRow(near: semanticPromptStartRowCache, where: { $0 === line })
+    }
+
+    /// The single entry point through which the OSC 133 handler stores a
+    /// shell-authored mark (R2). Same-kind re-marks replace.
+    func setSemanticMark(kind: SemanticPromptKind, row: Int, column: Int) {
+        guard row >= 0, row < lines.count else { return }
+        let line = lines[row]
+        guard line.count > 0 else { return }
+        // Every mark written while a group is active carries that group's ID;
+        // the group-opener's ID is what derivation compares a line's epoch to.
+        line.setSemanticMark(kind: kind, column: min(max(column, 0), line.count - 1),
+                             group: activeSemanticGroupID)
+    }
+
+    /// Shell-authored marks stored on a buffer row.
+    func semanticPromptMarks(at row: Int) -> [SemanticPromptAnchor] {
+        guard row >= 0, row < lines.count, lines[row].count > 0 else { return [] }
+        let line = lines[row]
+        return line.semanticMarks.map {
+            let column = min(max($0.column, 0), line.count - 1)
+            return SemanticPromptAnchor(position: Position(col: column, row: row), kind: $0.kind)
+        }
+    }
+
+    var activeSemanticPromptOrigin: Position? {
+        // D.3: resolve the row here, but take the mark selection from
+        // `rawSemanticOrigin` so the initial-wins-else-secondary rule lives in
+        // one place — click-time resolution and `copyFrom`'s liveness dedup
+        // cannot disagree about which mark is the origin.
+        guard let row = semanticPromptStartRow, lines[row].count > 0,
+              let origin = rawSemanticOrigin() else {
+            return nil
+        }
+        return Position(col: min(max(origin.column, 0), lines[row].count - 1), row: row)
+    }
+
+    /// The derived classification of a row (R5): `initial` for a row whose
+    /// line carries a group-opening mark; `continuation` for a row reachable
+    /// from such a row through the `isWrapped` chain, or through
+    /// hard-continuation lines whose epoch matches the origin mark's group ID;
+    /// nil otherwise. The group-ID match is what keeps an old group's stranded
+    /// continuation rows from joining a new prompt.
+    ///
+    /// A non-origin row's answer walks back up its chain, so a scan for
+    /// prompts asks `semanticRowOpensPrompt` instead: asking this of every
+    /// row over a long wrapped output is quadratic.
+    func semanticRowKind(at row: Int) -> SemanticPromptKind? {
+#if DEBUG
+        testingSemanticPromptRowVisits &+= 1
+#endif
+        guard row >= 0, row < lines.count else { return nil }
+        let activeOrigin = semanticPromptStartRow
+        if originMarkGroup(at: row, activeOrigin: activeOrigin) != nil {
+            return .initial
+        }
+        // F.1: classification is group-agnostic — a joining mark chains to its
+        // OWN group, matching how a hard-continuation epoch already does, so a
+        // completed PS2/right row derives `.continuation` even after a new
+        // group allocates (and the invariant checker no longer false-positives
+        // on finished multi-line commands).
+        if joiningMarkGroup(at: row) != nil {
+            return .continuation
+        }
+        var current = row
+        var epoch: UInt64? = nil
+        while current > 0 {
+#if DEBUG
+            testingSemanticPromptRowVisits &+= 1
+#endif
+            let line = lines[current]
+            if line.isWrapped {
+                // soft wrap: same physical write, same group inherently
+            } else if let g = line.semanticHardContinuationGroup {
+                if let e = epoch, e != g {
+                    return nil        // crossed into a different group's epoch
+                }
+                epoch = g
+            } else {
+                return nil            // chain broken
+            }
+            current -= 1
+            if let originGroup = originMarkGroup(at: current, activeOrigin: activeOrigin) {
+                // A hard chain must land on its own group's origin; a pure
+                // soft-wrap chain (epoch == nil) accepts any origin.
+                if let e = epoch {
+                    return originGroup == e ? .continuation : nil
+                }
+                return .continuation
+            }
+            if let joinGroup = joiningMarkGroup(at: current) {
+                if let e = epoch {
+                    return joinGroup == e ? .continuation : nil
+                }
+                return .continuation
+            }
+        }
+        return nil
+    }
+
+    /// Whether `semanticRowKind(at: row)` is `initial`, read from the row's
+    /// own marks.
+    func semanticRowOpensPrompt(_ row: Int) -> Bool {
+#if DEBUG
+        testingSemanticPromptRowVisits &+= 1
+#endif
+        return row >= 0 && row < lines.count && originMarkGroup(at: row, activeOrigin: semanticPromptStartRow) != nil
+    }
+
+    /// The group ID of a row's group-opening mark, or nil if the row is not an
+    /// origin. An `initial` mark is always an origin; a `secondary` mark counts
+    /// only on the tracked active origin row (an `A;k=s` group with no primary).
+    private func originMarkGroup(at row: Int, activeOrigin: Int?) -> UInt64? {
+        let line = lines[row]
+        if let mark = line.semanticMarks.first(where: { $0.kind == .initial }) {
+            return mark.group
+        }
+        if activeOrigin == row,
+           let mark = line.semanticMarks.first(where: { $0.kind == .secondary }) {
+            return mark.group
+        }
+        return nil
+    }
+
+    /// The group ID of a group-joining mark (secondary, continuation, or right)
+    /// on a row — a PS2 or right-prompt row that is part of that mark's group.
+    /// The single membership predicate used by both classification (any group)
+    /// and click geometry (restricted to the active group).
+    private func joiningMarkGroup(at row: Int) -> UInt64? {
+        lines[row].semanticMarks.first {
+            ($0.kind == .secondary || $0.kind == .continuation || $0.kind == .right)
+                && $0.group != 0
+        }?.group
+    }
+
+    /// Whether a row continues the active group across a hard boundary: its
+    /// epoch matches the active group, or it carries an active group-joining
+    /// mark (PS2/right). The click geometry uses this to walk the group.
+    func rowContinuesActiveGroupHard(_ row: Int) -> Bool {
+        guard row >= 0, row < lines.count, activeSemanticGroupID != 0 else { return false }
+        return lines[row].semanticHardContinuationGroup == activeSemanticGroupID
+            || joiningMarkGroup(at: row) == activeSemanticGroupID
+    }
+
+    func semanticPromptRelativeOrigin(for position: Position) -> Position? {
+        guard let primary = activeSemanticPromptOrigin else { return nil }
+        guard position.row >= primary.row else { return primary }
+        var relative = primary
+        for row in primary.row...min(position.row, lines.count - 1) {
+            // C.1: only the active group's own secondaries count — a stale
+            // secondary from a dead group surviving on a cleared screen must
+            // not skew the relative report.
+            for mark in lines[row].semanticMarks
+            where mark.kind == .secondary && mark.group == activeSemanticGroupID {
+                if row < position.row || mark.column <= position.col {
+                    relative = Position(col: mark.column, row: row)
+                }
+            }
+        }
+        return relative
+    }
+    var defaultBidiState: BidiPresentationState
+
+    /// The terminal that owns this buffer, set right after construction.
+    ///
+    /// This replaces a `scroll: (Bool) -> ()` closure that every owner
+    /// installed as `{ [weak self] wrapped in self?.scroll(isWrapped: wrapped) }`.
+    /// That `weak` capture was enough to move `Terminal` onto the runtime's
+    /// side-table refcount path permanently — about 9x on every retain and
+    /// release of the terminal — and it also paid a weak load per scrolled
+    /// line, in the single hottest path the parser has. A back-pointer plus a
+    /// direct call removes both, and the closure indirection with them.
+    ///
+    /// `unowned(unsafe)` is sound because a buffer is a stored property of its
+    /// terminal and cannot outlive it. See `Docs/io-cpu-profile.md` §3.1.
+#if SWIFTTERM_EMBEDDED
+    var terminal: Terminal? = nil
+#else
+    unowned(unsafe) var terminal: Terminal! = nil
+#endif
+
+    /// Scrolls the terminal that owns this buffer.
+    @inline(__always)
+    func scroll (_ isWrapped: Bool) {
+#if SWIFTTERM_EMBEDDED
+        // Embedded uses a breakable optional back-reference so `Terminal.close()`
+        // can release its object graph.
+        terminal?.scroll (isWrapped: isWrapped)
+#else
+        // This is a row-level hot path. Keep the normal-build back-reference
+        // direct: using the Embedded optional dispatch here caused a measurable
+        // scrolling regression. The buffer is owned by its terminal, so the
+        // `unowned(unsafe)` reference above is valid for this build.
+        terminal.scroll (isWrapped: isWrapped)
+#endif
+    }
+
+
     func setInsertMode(_ value: Bool) {
         self.insertMode = value
+        bulkInsertBlocked = insertMode || characterProtection
+    }
+
+    func setCharacterProtection(_ value: Bool) {
+        self.characterProtection = value
+        bulkInsertBlocked = insertMode || characterProtection
     }
 
     func setMarginMode(_ value: Bool) {
@@ -270,7 +767,15 @@ public final class Buffer {
         self.wraparound = value
     }
 
-    public init (cols: Int, rows: Int, tabStopWidth: Int, scrollback: Int?) {
+    public convenience init (cols: Int, rows: Int, tabStopWidth: Int, scrollback: Int?,
+                             bidiState: BidiPresentationState = .default) {
+        self.init(cols: cols, rows: rows, tabStopWidth: tabStopWidth,
+                  scrollback: scrollback, bidiState: bidiState, arena: CellArena())
+    }
+
+    init (cols: Int, rows: Int, tabStopWidth: Int, scrollback: Int?,
+          bidiState: BidiPresentationState = .default, arena: CellArena) {
+        cellArena = arena
         self.hasScrollback = scrollback != nil
         _yDisp = 0
         xDisp = 0
@@ -281,20 +786,43 @@ public final class Buffer {
         xBase = 0
         _scrollTop = 0
         _scrollBottom = rows - 1
+        _marginLeft = 0
+        _marginRight = cols - 1
         linesTop = 0
         _x = 0
         _y = 0
         self._cols = cols
         self._rows = rows
         self.scrollback = scrollback
+        self.defaultBidiState = bidiState
         
         let len = hasScrollback ? (scrollback ?? 0) + rows : rows
         _lines = CircularBufferLineList (maxLength: len)
-        _lines.makeEmpty = { [unowned self] line in getBlankLine(attribute: CharData.defaultAttr, isWrapped: false) }
+        // Must precede setupLinesCallbacks: attaching a line stamps `selfRef`.
+        selfRef = BufferRef (self)
         setupLinesCallbacks()
         setupTabStops (tabStopWidth: tabStopWidth)
     }
-        
+
+    deinit {
+        // Anything still holding the box — a line that outlived this buffer —
+        // now reads nil instead of a dangling pointer.
+        selfRef?.buffer = nil
+    }
+
+#if SWIFTTERM_EMBEDDED
+    func releaseEmbeddedReferences() {
+        terminal = nil
+        _lines.owner = nil
+        _lines.isLive = false
+        selfRef?.buffer = nil
+        for line in _lines.getArray() {
+            line?.owningBufferRef = nil
+        }
+    }
+#endif
+
+
     public func getCorrectBufferLength (_ rows: Int) -> Int
     {
         if hasScrollback {
@@ -310,17 +838,50 @@ public final class Buffer {
         let fgbg = attribute == nil ? Attribute.empty : attribute!.justColor ()
         return CharData(attribute: fgbg, scalar: UnicodeScalar(32)!, size: 1)
     }
+
+    func getPackedNullCell(attribute: Attribute? = nil) -> PackedCell {
+        let color = attribute?.justColor() ?? Attribute.empty
+        return cellArena.pack(attribute: color, scalar: 32, widthState: .narrow)!
+    }
+
+    func getPackedBlankCell(attribute: Attribute) -> PackedCell {
+        cellArena.pack(attribute: attribute, scalar: 0, widthState: .narrow)!
+    }
     
     public func getBlankLine (attribute: Attribute, isWrapped: Bool = false) -> BufferLine
     {
-        let cd = CharData (attribute: attribute)
-        
-        return BufferLine(cols: cols, fillData: cd, isWrapped: isWrapped)
+        makeBlankLine(cols: cols, packedBlank: getPackedBlankCell(attribute: attribute),
+                      isWrapped: isWrapped)
+    }
+
+    /// Creates a blank row without converting an arena-owned cell back through
+    /// `Attribute`.
+    func getBlankLine(packedBlank: PackedCell, isWrapped: Bool = false) -> BufferLine {
+        makeBlankLine(cols: cols, packedBlank: packedBlank, isWrapped: isWrapped)
+    }
+
+    func getBlankLine(packedBlank: PackedCell, isWrapped: Bool,
+                      bidiState: BidiPresentationState) -> BufferLine {
+        makeBlankLine(cols: cols, packedBlank: packedBlank,
+                      isWrapped: isWrapped, bidiState: bidiState)
+    }
+
+    private func makeBlankLine(cols: Int, packedBlank: PackedCell,
+                               isWrapped: Bool = false,
+                               bidiState: BidiPresentationState? = nil) -> BufferLine
+    {
+        let line = BufferLine(cols: cols, packedFill: packedBlank,
+                              blankTailCell: packedBlank,
+                              isWrapped: isWrapped,
+                              bidiState: bidiState ?? defaultBidiState,
+                              arena: cellArena)
+        line.owningBuffer = self
+        return line
     }
     
     func makeEmptyLine (_ line: Int) -> BufferLine
     {
-        return getBlankLine(attribute: CharData.defaultAttr, isWrapped: false)
+        getBlankLine(packedBlank: PackedCell(), isWrapped: false)
     }
     
     /**
@@ -356,12 +917,22 @@ public final class Buffer {
         x = 0
         y = 0
 
-        _lines = CircularBufferLineList (maxLength: getCorrectBufferLength(rows))
-        _lines.makeEmpty = { [unowned self] line in getBlankLine(attribute: CharData.defaultAttr, isWrapped: false) }
-        setupLinesCallbacks()
-        _linesWithImagesCount = 0
+        // Reset in place: `_lines` is a `let` so the hot ring accesses can
+        // borrow it without ARC traffic. Owner and liveness survive the reset,
+        // and the live list reports every dropped line with images, so
+        // `_linesWithImagesCount` is already back to zero afterwards.
+        _lines.reset(maxLength: getCorrectBufferLength(rows))
         scrollTop = 0
         scrollBottom = rows - 1
+        marginLeft = 0
+        marginRight = cols - 1
+        semanticContent = .none
+        semanticInput = .idle
+        semanticClickMode = .none
+        semanticUsesSpecialCursorKeys = false
+        semanticPromptStartLine = nil
+        semanticGroupCounter = 0
+        activeSemanticGroupID = 0
 
         // Figure out how to do this elegantly
         // SetupTabStops ()
@@ -375,10 +946,10 @@ public final class Buffer {
         savedCharset = CharSets.defaultCharset
         marginRight = cols-1
         marginLeft = 0
-        savedWraparound = false
         savedOriginMode = false
         savedMarginMode = false
-        savedReverseWraparound = false
+        savedCharacterProtection = false
+        savedPendingWrap = false
     }
     
     public var isCursorInViewPort : Bool {
@@ -396,8 +967,9 @@ public final class Buffer {
             return
         }
         let attr = attribute != nil ? attribute! : CharData.defaultAttr
+        let packedBlank = getPackedBlankCell(attribute: attr)
         for _ in 0..<rows {
-            _lines.push (getBlankLine (attribute: attr))
+            _lines.push(getBlankLine(packedBlank: packedBlank))
         }
     }
     
@@ -407,12 +979,15 @@ public final class Buffer {
     
     public func resize (newCols : Int, newRows : Int)
     {
-        if marginRight > newCols - 1 {
-            marginRight = newCols - 1
-        }
-        if marginLeft >= marginRight {
-            marginLeft = marginRight
-        }
+        let defaultBlank = PackedCell()
+        // A pending wrap counts as the column after the cursor. If the new
+        // width has room for that column, the cursor goes there and the wrap
+        // is cancelled; if not, the cursor stays on the last column and the
+        // wrap stays pending, as in xterm and Ghostty.
+        let cursorColumns = columnsBeforeCursor
+        let savedColumns = savedPendingWrap ? savedX + 1 : savedX
+        marginLeft = 0
+        marginRight = newCols - 1
         let newMaxLength = getCorrectBufferLength(newRows)
         if newMaxLength > lines.maxLength {
             lines.maxLength = newMaxLength
@@ -421,8 +996,14 @@ public final class Buffer {
             // Deal with columns increasing (reducing needs to happen after reflow)
             
             if cols < newCols {
-                for i in 0..<lines.maxLength {
-                    lines [i].resize (cols: newCols, fillData: CharData.Null)
+                // Iterate only the lines that exist: touching every capacity slot
+                // materializes a BufferLine per empty slot (the CircularList subscript
+                // calls makeEmpty), making resize O(scrollback capacity). Empty slots
+                // are created on demand at the buffer's current cols, so they never
+                // need resizing here.
+                for i in 0..<lines.count {
+                    lines[i].resize(cols: newCols,
+                                    fill: defaultBlank)
                 }
 
             }
@@ -430,9 +1011,9 @@ public final class Buffer {
             // Resize rows in both directions as needed
             var addToY = 0
             if rows < newRows {
-                for y in rows..<newRows {
+                for _ in rows..<newRows {
                     if lines.count < newRows + yBase {
-                        if yBase > 0 && lines.count <= yBase + y + addToY + 1 {
+                        if yBase > 0 && lines.count <= yBase + self.y + addToY + 1 {
                             // There is room above the buffer and there are no empty elements below the line,
                             // scroll up
                             yBase -= 1
@@ -444,7 +1025,8 @@ public final class Buffer {
                         } else {
                             // Add a blank line if there is no buffer left at the top to scroll to, or if there
                             // are blank lines after the cursor
-                            lines.push (BufferLine (cols: newCols, fillData: CharData.Null))
+                            lines.push(makeBlankLine(cols: newCols,
+                                                     packedBlank: defaultBlank))
                         }
                     }
                 }
@@ -479,13 +1061,10 @@ public final class Buffer {
             }
 
             // Make sure that the cursor stays on screen
-            x = min (x, newCols - 1)
             y = min (y, newRows - 1)
             if addToY != 0 {
                 y += addToY
             }
-
-            savedX = min (savedX, newCols - 1)
 
             scrollTop = 0
         }
@@ -503,26 +1082,53 @@ public final class Buffer {
             reflow (newCols, newRows)
             // Trim the end of the line off if cols shrunk
             if cols > newCols {
-                for i in 0..<lines.maxLength {
-                    lines [i].resize (cols: newCols, fillData: CharData.Null)
+                // lines.count, not lines.maxLength (see the widen loop above).
+                for i in 0..<lines.count {
+                    lines[i].resize(cols: newCols,
+                                    fill: defaultBlank)
                 }
             }
         }
         
         // DEBUG: Post-condition
         if lines.count > 0 {
-            for i in 0..<lines.maxLength {
+            // lines.count, not lines.maxLength: checking every capacity slot would
+            // materialize blank lines for the whole scrollback on every resize and,
+            // worse, they would be created at the old `cols` (updated below) and
+            // trip the abort() when widening.
+            for i in 0..<lines.count {
                 let line = lines [i]
                 if line.count < newCols {
                     print ("stop here newCols=\(newCols) but the element has: \(line.count)")
-                    abort ()
+                    fatalError("A resized line is shorter than the buffer width")
                 }
             }
         }
         rows = newRows
         cols = newCols
+        if lines.count > 0 {
+            // After reflow: it moves rows, which clears the flag.
+            _x = min (cursorColumns, newCols - 1)
+            pendingWrap = cursorColumns >= newCols
+            savedX = min (savedColumns, newCols - 1)
+            savedPendingWrap = savedColumns >= newCols
+        }
     }
     
+    /// Removes the scrollback history (the lines above the visible screen)
+    /// without touching the visible screen contents or the buffer's capacity
+    public func clearScrollback ()
+    {
+        guard yBase > 0 else {
+            return
+        }
+        let amountToTrim = yBase
+        lines.trimStart (count: amountToTrim)
+        yBase = 0
+        yDisp = 0
+        // savedY is relative to the screen, which doesn't move here.
+    }
+
     public func changeHistorySize (_ newScrollback: Int?)
     {
         self.scrollback = newScrollback
@@ -548,11 +1154,71 @@ public final class Buffer {
             }
         }
     }
+
+    /// R7: the structural invariants of the stored-marks model. Behavioral
+    /// tests assert observable output; this asserts the storage rules.
+    func semanticPromptInvariantsHold() -> Bool {
+        let activeOrigin = semanticPromptStartRow
+        for row in 0..<lines.count {
+            let line = lines[row]
+            var seenKinds: [SemanticPromptKind] = []
+            for mark in line.semanticMarks {
+                // Continuation is a derived row kind; storing it is a bug
+                // by definition.
+                if mark.kind == .continuation {
+                    return false
+                }
+                // No two marks of the same kind on one line.
+                if seenKinds.contains(mark.kind) {
+                    return false
+                }
+                seenKinds.append(mark.kind)
+                // Every mark column is inside the line's content width.
+                if mark.column < 0 || mark.column >= line.count {
+                    return false
+                }
+                // No mark records a group beyond the counter that issues them.
+                if mark.group > semanticGroupCounter {
+                    return false
+                }
+            }
+            // D.2: no continuation epoch exceeds the group counter.
+            if let epoch = line.semanticHardContinuationGroup, epoch > semanticGroupCounter {
+                return false
+            }
+            // B.3: an attached line's owner is this buffer (never leaks a
+            // cross-buffer owner). Marks require an owner for liveness dedup.
+            if line.owningBuffer !== nil && line.owningBuffer !== self {
+                return false
+            }
+            // D.2: no `.prompt`-tagged cell on a row whose derived kind is nil.
+            if semanticRowKind(at: row) == nil {
+                for column in 0..<line.count {
+                    if case .prompt = line.packedView(at: column).semanticContent {
+                        return false
+                    }
+                }
+            }
+        }
+        // The origin resolves to a line carrying a group-opening mark, and
+        // that row derives as `initial`.
+        if let row = activeOrigin {
+            guard originMarkGroup(at: row, activeOrigin: row) != nil,
+                  semanticRowKind(at: row) == .initial else {
+                return false
+            }
+        }
+        // The one-pass prompt scan agrees with the row-by-row derivation.
+        for row in 0..<lines.count where semanticRowOpensPrompt(row) != (semanticRowKind(at: row) == .initial) {
+            return false
+        }
+        return true
+    }
     
-    func translateBufferLineToString (lineIndex: Int, trimRight: Bool, startCol: Int = 0, endCol: Int = -1, skipNullCellsFollowingWide: Bool = false, characterProvider: ((CharData) -> Character)? = nil) -> String
+    func translateBufferLineToString (lineIndex: Int, trimRight: Bool, startCol: Int = 0, endCol: Int = -1, skipNullCellsFollowingWide: Bool = false, characterProvider: ((CharData) -> Character)? = nil, textProvider: ((CharData) -> String)? = nil) -> String
     {
         let line = _lines [lineIndex]
-        return line.translateToString(trimRight: trimRight, startCol: startCol, endCol: endCol, skipNullCellsFollowingWide: skipNullCellsFollowingWide, characterProvider: characterProvider)
+        return line.translateToString(trimRight: trimRight, startCol: startCol, endCol: endCol, skipNullCellsFollowingWide: skipNullCellsFollowingWide, characterProvider: characterProvider, textProvider: textProvider)
     }
     
     func setupTabStops (index: Int = -1, tabStopWidth: Int)
@@ -643,7 +1309,13 @@ public final class Buffer {
     {
         // If this is the last row in the wrapped line, get the actual trimmed length
         if nextLine == nil {
-            return line.getTrimmedLength ()
+            return min (line.getTrimmedLength (), line.count)
+        }
+        // A line can be shorter than the old width; do not count cells that
+        // are not there.
+        let cols = min (cols, line.count)
+        if cols <= 0 {
+            return 0
         }
 
         // Detect whether the following line starts with a wide character and the end of the current line
@@ -659,7 +1331,8 @@ public final class Buffer {
         return cols
     }
 
-    func getLinesToRemove (oldCols: Int, newCols: Int, bufferAbsoluteY: Int, nullChar: CharData) -> [Int]
+    func getLinesToRemove (oldCols: Int, newCols: Int, bufferAbsoluteY: Int,
+                           nullCell: PackedCell) -> [Int]
     {
         // Gather all BufferLines that need to be removed from the Buffer here so that they can be
         // batched up and only committed once
@@ -694,7 +1367,7 @@ public final class Buffer {
 
             // Copy buffer data to new locations
             var destLineIndex = 0
-            var destCol = getWrappedLineTrimmedLength (lines, destLineIndex, oldCols)
+            var destCol = getWrappedLineTrimmedLength (wrappedLines, destLineIndex, oldCols)
             var srcLineIndex = 1
             var srcCol = 0
             while srcLineIndex < wrappedLines.count {
@@ -726,13 +1399,15 @@ public final class Buffer {
                         wrappedLines [destLineIndex].copyFrom (wrappedLines [destLineIndex - 1], srcCol: newCols - 1, dstCol: destCol, len: 1)
                         destCol += 1
                         // Null out the end of the last row
-                        wrappedLines [destLineIndex - 1].replaceCells (start: newCols - 1, end: newCols, fillData: nullChar)
+                        wrappedLines[destLineIndex - 1].replacePackedCells(
+                            start: newCols - 1, end: newCols, fill: nullCell)
                     }
                 }
             }
 
             // Clear out remaining cells or fragments could remain;
-            wrappedLines [destLineIndex].replaceCells (start: destCol, end: newCols, fillData: nullChar)
+            wrappedLines[destLineIndex].replacePackedCells(
+                start: destCol, end: newCols, fill: nullCell)
 
             // Work backwards and remove any rows at the end that only contain null cells
             var countToRemove = 0
@@ -760,7 +1435,9 @@ public final class Buffer {
     
     func reflowWider (_ oldCols: Int, _ oldRows: Int, _ newCols: Int, _ newRows: Int)
     {
-        let toRemove = getLinesToRemove(oldCols: oldCols, newCols: newCols, bufferAbsoluteY: yBase + y, nullChar: CharData.Null)
+        let toRemove = getLinesToRemove(
+            oldCols: oldCols, newCols: newCols, bufferAbsoluteY: yBase + y,
+            nullCell: PackedCell())
         
         //print ("Lines to remove: \(toRemove) \(toRemove.count)")
         if toRemove.count > 0 {
@@ -795,7 +1472,7 @@ public final class Buffer {
 
             // Apply the new layout
             let newLayoutLines = CircularBufferLineList (maxLength: lines.count)
-            newLayoutLines.makeEmpty = { [unowned self] line in getBlankLine(attribute: CharData.defaultAttr, isWrapped: false) }
+            newLayoutLines.owner = self
             for i in 0..<layout.count {
                   newLayoutLines.push (lines [layout [i]])
             }
@@ -817,7 +1494,8 @@ public final class Buffer {
     
                     if lines.count < newRows {
                         // Add an extra row at the bottom of the viewport
-                        lines.push (BufferLine (cols: newCols, fillData: CharData.Null))
+                        lines.push(makeBlankLine(cols: newCols,
+                                                 packedBlank: PackedCell()))
                     }
                 } else {
                     if yDisp == yBase {
@@ -938,9 +1616,11 @@ public final class Buffer {
 
             // Add the new lines
             var newLines : [BufferLine] = []
+            let paragraphBidiState = wrappedLines[0].bidiState
             if linesToAdd > 0 {
                 for _ in 0..<linesToAdd {
-                    let newLine = getBlankLine (attribute: CharData.defaultAttr, isWrapped: true)
+                    let newLine = getBlankLine(packedBlank: PackedCell(), isWrapped: true)
+                    newLine.bidiState = paragraphBidiState
                     newLines.append (newLine)
                 }
             }
@@ -953,6 +1633,9 @@ public final class Buffer {
             for l in newLines {
                 wrappedLines.append (l)
             }
+            for line in wrappedLines {
+                line.bidiState = paragraphBidiState
+            }
 
             // Copy buffer data to new locations, this needs to happen backwards to do in-place
             var destLineIndex = destLineLengths.count - 1 // Math.floor(cellsNeeded / newCols)
@@ -964,7 +1647,11 @@ public final class Buffer {
 
             var srcLineIndex = wrappedLines.count - linesToAdd - 1
             var srcCol = lastLineLength
-            while srcLineIndex >= 0 {
+            // The lengths come from the line contents. Keep each copy inside
+            // both lines, and stop when there is no destination line.
+            while srcLineIndex >= 0 && destLineIndex >= 0 {
+                srcCol = min (srcCol, wrappedLines [srcLineIndex].count)
+                destCol = min (destCol, wrappedLines [destLineIndex].count)
                 let cellsToCopy = min (srcCol, destCol)
                 wrappedLines [destLineIndex].copyFrom (wrappedLines [srcLineIndex], srcCol: srcCol - cellsToCopy, dstCol: destCol - cellsToCopy, len: cellsToCopy)
                 destCol -= cellsToCopy
@@ -984,9 +1671,11 @@ public final class Buffer {
             }
 
             // Null out the end of the line ends if a wide character wrapped to the following line
-            for i in 0..<wrappedLines.count {
-                if destLineLengths [i] < newCols {
-                    wrappedLines [i] [destLineLengths [i]] = CharData.Null
+            for i in 0..<min (wrappedLines.count, destLineLengths.count) {
+                if destLineLengths [i] < newCols && destLineLengths [i] < wrappedLines[i].count {
+                    wrappedLines[i].setPackedCell(
+                        PackedCell(),
+                        at: destLineLengths[i])
                 }
             }
 
@@ -1032,6 +1721,7 @@ public final class Buffer {
 
             // Record original lines so they don't get overridden when we rearrange the list
             let originalLines = CircularBufferLineList (maxLength: lines.maxLength)
+            originalLines.owner = self
             for i in 0..<lines.count {
                 originalLines.push (lines [i])
             }
@@ -1091,10 +1781,15 @@ public final class Buffer {
         recalculateLinesWithImagesCount()
     }
     
-    static var n = 0
-    
+#if !SWIFTTERM_EMBEDDED
+    private static let dumpSequence = Locked(0)
+
     func dump ()
     {
+        let sequence = Buffer.dumpSequence.withLock { sequence in
+            defer { sequence += 1 }
+            return sequence
+        }
         var str = ""
         str += "xDisp=\(xDisp), yDisp=\(yDisp), xBase=\(xBase), yBase=\(yBase)\n"
         str += "scrollTop=\(scrollTop) scrollBottom=\(scrollBottom)\n"
@@ -1107,145 +1802,319 @@ public final class Buffer {
                 txt = "<empty>"
             }
             let flag = i >= yDisp ? ">>" : "  "
-            let istr = String (format: "%03d", i)
-            let cstr = String (format: "%03d", _lines.debugGetCyclicIndex(i))
+            let istr = String(i).leftPadding(toLength: 3, withPad: "0")
+            let cstr = String(_lines.debugGetCyclicIndex(i)).leftPadding(toLength: 3, withPad: "0")
             str += "[\(istr):\(cstr)]\(flag)\(txt)\n"
         }
-        let file = "/Users/miguel/Downloads/Logs/dump-\(Buffer.n)"
+        let file = "/Users/miguel/Downloads/Logs/dump-\(sequence)"
         do {
             try str.write(to: URL.init (fileURLWithPath: file), atomically: false, encoding: .utf8)
 
         } catch {
             print ("Could not log the dump() contents to \(file)")
         }
-        Buffer.n += 1
     }
+#endif
     
-    // This variable holds the last location that we poked a Character on.   This is required
-    // because combining unicode characters come after the character, so we need to poke back
-    // at this location.   We track the buffer (so we can distinguish Alt/Normal), the buffer line
-    // that we fetched, and the column.
-    var lastBufferStorage: (y: Int, x: Int, cols: Int, rows: Int) = (0, 0, 0, 0)
+    @inline(__always)
+    var allowsBulkInsert: Bool { !bulkInsertBlocked }
 
     /// Bulk-inserts ASCII characters (all width-1, non-combining).
-    /// Returns number of bytes consumed. Returns 0 if insert mode is active.
-    func insertAsciiRun(_ bytes: ArraySlice<UInt8>, attribute: Attribute) -> Int {
-        guard !insertMode else { return 0 }
-        let right = marginMode ? _marginRight : _cols - 1
-        var consumed = 0
+    /// Returns number of bytes consumed. Returns 0 if insert mode or
+    /// character protection is active.
+    func insertAsciiRun(_ bytes: ArraySlice<UInt8>, styleID: UInt16,
+                        payloadCode: UInt16) -> Int {
+        guard allowsBulkInsert else { return 0 }
+        let semanticCode = CellArena.semanticContentCode(for: semanticContent)
+        // `&-`: cols is at least 1, and the overflow check costs
+        // instructions on each call.
+        let marginRight = marginMode ? _marginRight : _cols &- 1
+        // As xterm: a cursor right of the right margin writes to the last
+        // column of the line. After a wrap the cursor is inside the margins.
+        var right = _x > marginRight ? _cols &- 1 : marginRight
+        if pendingWrap {
+            // With DECAWM reset, the scalar path overwrites the last cell.
+            guard wraparound else { return 0 }
+            pendingWrap = false
+            right = marginRight
+            wrapCursorToNextLine()
+        }
         var idx = bytes.startIndex
-
-        while idx < bytes.endIndex {
-            if _x > right {
-                guard wraparound else { break }
-                _x = marginMode ? _marginLeft : 0
-                if _y >= _scrollBottom {
-                    scroll(true)
-                } else {
-                    _y += 1
-                    _lines[_y].isWrapped = true
-                }
-            }
+        while true {
             let available = right - _x + 1
             let runLen = min(available, bytes.endIndex - idx)
             let row = _lines[_y + _yBase]
-            for i in 0..<runLen {
-                row[_x + i] = CharData(attribute: attribute, code: Int32(bytes[idx + i]), size: 1)
-            }
-            _x += runLen
-            consumed += runLen
+            clearTextOverwrittenImagesFromLine(row)
+            row.setPackedAsciiRun(bytes, sourceStart: idx, count: runLen, at: _x,
+                                  styleID: styleID, payloadCode: payloadCode,
+                                  semanticContentCode: semanticCode)
             idx += runLen
+            if runLen < available {
+                _x += runLen
+                break
+            }
+            // The run fills the line. See the Span version.
+            if idx == bytes.endIndex || !wraparound {
+                _x = right
+                pendingWrap = true
+                break
+            }
+            right = marginRight
+            wrapCursorToNextLine()
         }
-        if consumed > 0 {
-            lastBufferStorage = (_y + _yBase, _x - 1, _cols, _rows)
+        return idx - bytes.startIndex
+    }
+
+    /// Bulk-inserts borrowed ASCII characters (all width-1, non-combining).
+    /// Returns the number of bytes consumed. Returns 0 if insert mode or
+    /// character protection is active.
+    func insertAsciiRun(_ bytes: Span<UInt8>, styleID: UInt16,
+                        payloadCode: UInt16) -> Int {
+        guard allowsBulkInsert else { return 0 }
+        let semanticCode = CellArena.semanticContentCode(for: semanticContent)
+        // `&-`: cols is at least 1, and the overflow check costs
+        // instructions on each call.
+        let marginRight = marginMode ? _marginRight : _cols &- 1
+        // As xterm: a cursor right of the right margin writes to the last
+        // column of the line. After a wrap the cursor is inside the margins.
+        var right = _x > marginRight ? _cols &- 1 : marginRight
+        if pendingWrap {
+            // With DECAWM reset, the scalar path overwrites the last cell.
+            guard wraparound else { return 0 }
+            pendingWrap = false
+            right = marginRight
+            wrapCursorToNextLine()
+        }
+        var consumed = 0
+        while true {
+            let available = right - _x + 1
+            let runLength = min(available, bytes.count - consumed)
+            // Borrow the line from its slot. The subscript copies the line
+            // and costs a retain and a release for each run.
+            let x = _x
+            _lines.withLine(_y + _yBase) { row in
+                clearTextOverwrittenImagesFromLine(row)
+                row.setPackedAsciiRun(bytes, sourceStart: consumed, count: runLength,
+                                      at: x, styleID: styleID, payloadCode: payloadCode,
+                                      semanticContentCode: semanticCode)
+            }
+            consumed += runLength
+            if runLength < available {
+                _x += runLength
+                break
+            }
+            // The run fills the line. When more bytes follow, wrap now and
+            // do not store the flag: two more stores after the row fill
+            // stall on the full store buffer.
+            if consumed == bytes.count || !wraparound {
+                _x = right
+                pendingWrap = true
+                break
+            }
+            right = marginRight
+            wrapCursorToNextLine()
         }
         return consumed
     }
 
-    func insertCharacter(_ charData: CharData) {
-        var chWidth = Int (charData.width)
+    /// Moves the cursor to the left margin of the next line for an
+    /// autowrap: scrolls at the bottom of the scroll region, else marks the
+    /// next line as wrapped. The caller clears ``pendingWrap``.
+    @inline(__always)
+    func wrapCursorToNextLine() {
+        _x = marginMode ? _marginLeft : 0
+        if _y >= _scrollBottom {
+            scroll(true)
+        } else {
+            let paragraphBidiState = _lines[_y + _yBase].bidiState
+            _y += 1
+            _lines[_y + _yBase].isWrapped = true
+            _lines[_y + _yBase].bidiState = paragraphBidiState
+        }
+    }
+
+    /// Inserts scalars of width 1 or 2 (`widths`) and wraps as
+    /// `insertCharacter` does. `columns` is the sum of `widths`. Returns how
+    /// many scalars it inserted; the caller inserts the rest with the scalar
+    /// path.
+    func insertScalarRun(_ scalars: UnsafeBufferPointer<UInt32>, widths: UnsafeBufferPointer<UInt8>,
+                         columns: Int, styleID: UInt16, payloadCode: UInt16) -> Int {
+        guard allowsBulkInsert else { return 0 }
+        precondition(widths.count == scalars.count)
+        var remainingColumns = columns
+        let semanticCode = CellArena.semanticContentCode(for: semanticContent)
+        let left = marginMode ? _marginLeft : 0
+        let marginRight = marginMode ? _marginRight : _cols - 1
+        var consumed = 0
+
+        while consumed < scalars.count {
+            let width = Int(widths[consumed])
+            precondition(width == 1 || width == 2)
+            // As xterm: a cursor right of the right margin writes to the
+            // last column of the line.
+            var right = _x > marginRight ? _cols - 1 : marginRight
+            // The scalar fallback owns the behavior when the complete region
+            // cannot hold one glyph. Do not change the cursor before the fallback.
+            guard right - left + 1 >= width else { break }
+            // A pending wrap, or a wide glyph on the last column.
+            if pendingWrap || _x + width - 1 > right {
+                guard wraparound else { break }
+                pendingWrap = false
+                right = marginRight
+                _x = left
+                if _y >= _scrollBottom {
+                    scroll(true)
+                } else {
+                    let paragraphBidiState = _lines[_y + _yBase].bidiState
+                    _y += 1
+                    _lines[_y + _yBase].isWrapped = true
+                    _lines[_y + _yBase].bidiState = paragraphBidiState
+                }
+            }
+            // The scalars that fit on this row from the cursor. A remainder of
+            // one width needs no pass over `widths`.
+            let remaining = scalars.count - consumed
+            var end: Int
+            var column: Int
+            if remainingColumns == remaining || remainingColumns == remaining * 2 {
+                let fit = min(remaining, (right - _x + 1) / width)
+                end = consumed + fit
+                column = _x + fit * width
+            } else {
+                end = consumed
+                column = _x
+                while end < scalars.count && column + Int(widths[end]) - 1 <= right {
+                    column += Int(widths[end])
+                    end += 1
+                }
+            }
+            guard end > consumed else { break }
+            remainingColumns -= column - _x
+            let row = _lines[_y + _yBase]
+            clearTextOverwrittenImagesFromLine(row)
+            row.setPackedScalarRun(
+                scalars, widths: widths, sourceStart: consumed, count: end - consumed,
+                columns: column - _x, at: _x, styleID: styleID,
+                payloadCode: payloadCode, semanticContentCode: semanticCode)
+            // A run that fills the line keeps the cursor on its last cell,
+            // with a wrap pending.
+            if column > right {
+                _x = right
+                pendingWrap = true
+            } else {
+                _x = column
+            }
+            consumed = end
+        }
+        return consumed
+    }
+
+    func insertCharacter(_ inputCell: PackedCell) {
+        // D.1: stamp the OSC 133 role once, here at the insertion funnel, from
+        // the buffer's own classification. No caller can forget to stamp, and
+        // during ordinary output `semanticContent` is `.none` (a no-op).
+        var cell = inputCell.replacingSemanticContentCode(
+            CellArena.semanticContentCode(for: semanticContent))
+        if characterProtection {
+            cell = cell.replacingProtection(true)
+        }
+        var chWidth = Int(cellArena.width(for: cell))
         
-        let right = marginMode ? _marginRight : _cols - 1
-        // goto next line if ch would overflow
+        let marginRight = marginMode ? _marginRight : _cols - 1
+        // As xterm: a cursor right of the right margin writes to the last
+        // column of the line.
+        var right = _x > marginRight ? _cols - 1 : marginRight
+        // A pending wrap goes first. With DECAWM reset it is only cancelled,
+        // and the character overwrites the last cell (xterm `dotext`).
+        // A wide character that does not fit on the last column wraps with
+        // DECAWM set, and is dropped with DECAWM reset (as xterm and Ghostty).
         // TODO: needs a global min terminal width of 2
-        // FIXME: additionally ensure chWidth fits into a line
-        //   -->  maybe forbid cols<xy at higher level as it would
-        //        introduce a bad runtime penalty here
-        if _x + chWidth - 1 > right {
-            // autowrap - DECAWM
-            // automatically wraps to the beginning of the next line
+        if pendingWrap || _x + chWidth - 1 > right {
+            pendingWrap = false
             if wraparound {
                 _x = marginMode ? _marginLeft : 0
+                right = marginRight
                 
                 if _y >= _scrollBottom {
                     scroll (true)
                 } else {
                     // The line already exists (eg. the initial viewport), mark it as a
                     // wrapped line
+                    let paragraphBidiState = _lines[_y + _yBase].bidiState
                     _y += 1
-                    _lines [_y].isWrapped = true
+                    _lines [_y + _yBase].isWrapped = true
+                    _lines [_y + _yBase].bidiState = paragraphBidiState
                 }
                 // row changed, get it again
-            } else {
-                if (chWidth == 2) {
-                    // FIXME: check for xterm behavior
-                    // What to do here? We got a wide char that does not fit into last cell
-                    return
-                }
-                // FIXME: Do we have to set buffer.x to cols - 1, if not wrapping?
-                _x = right
+            } else if _x + chWidth - 1 > right {
+                return
             }
+        }
+        // A wide glyph in a region of one column on the last column has no
+        // cell for its tail, also after the wrap. Drop it, as with DECAWM
+        // reset: a head without a tail makes the line seem one cell longer
+        // than it is, and reflow then reads past the line.
+        if _x + chWidth > _cols {
+            return
         }
         let bufferRow = _lines[_y+_yBase]
 
         // insert mode: move characters to right
         if insertMode {
-            var empty = CharData.Null
-            empty.attribute = curAttr
+            let empty = cellArena.pack(styleID: cell.styleID, scalar: 0,
+                                       widthState: .narrow)!
             // right shift cells according to the width
-            bufferRow.insertCells (pos: _x, n: chWidth, rightMargin: marginMode ? _marginRight : _cols-1, fillData: empty)
-            // test last cell - since the last cell has only room for
-            // a halfwidth char any fullwidth shifted there is lost
-            // and will be set to eraseChar
-            let lastCell = bufferRow [_cols - 1]
-            if lastCell.width == 2 {
-                bufferRow [_cols - 1] = empty
-            }
+            bufferRow.insertPackedCells(pos: _x, n: chWidth,
+                                        rightMargin: marginMode ? _marginRight : _cols - 1,
+                                        fill: empty)
         }
 
-        // write current char to buffer and advance cursor
-        lastBufferStorage = (_y + _yBase, _x, _cols, _rows)
-        if _x >= _cols {
-            _x = _cols-1
-        }
-        bufferRow[_x] = charData
-        _x += 1
+        // Write current char to buffer and advance cursor.
+        clearTextOverwrittenImagesFromLine(bufferRow)
+        bufferRow.repairSeamsForWrite(at: _x, width: chWidth)
+        bufferRow.setPackedCell(cell, at: _x)
+        var last = _x
 
         // fullwidth char - also set next cell to placeholder stub and advance cursor
         // for graphemes bigger than fullwidth we can simply loop to zero
         // we already made sure above, that buffer.x + chWidth will not overflow right
         if chWidth > 1 {
-            let wideEmpty = CharData(attribute: curAttr, scalar: UnicodeScalar(0)!, size: 0)
+            let packedWideEmpty = cellArena.pack(
+                styleID: cell.styleID, scalar: 0, widthState: .spacerTail,
+                payloadCode: cell.payloadCode,
+                semanticContentCode: cell.semanticContentCode,
+                isProtected: characterProtection)!
             chWidth -= 1
-            while chWidth != 0 && _x < _cols {
-                bufferRow [_x] = wideEmpty
-                _x += 1
+            while chWidth != 0 && last + 1 < _cols {
+                last += 1
+                bufferRow.setPackedCell(packedWideEmpty, at: last)
                 chWidth -= 1
             }
         }
-        
+        // A write that reaches the last column keeps the cursor on it, with
+        // a wrap pending (also with DECAWM reset, as xterm). A wide glyph in a
+        // region of one column puts its tail past the margin; the cursor then
+        // goes after the tail, as before the flag existed.
+        if last == right || last + 1 >= _cols {
+            _x = last
+            pendingWrap = true
+        } else {
+            _x = last + 1
+        }
     }
     
+#if !SWIFTTERM_EMBEDDED
     func dumpConsole ()
     {
         let debugBuffer = self
         for y in 0..<debugBuffer._lines.maxLength {
             let flag = y == debugBuffer.yDisp ? "D" : " "
             let yb   = y == debugBuffer.yBase ? "B" : " "
-            let istr = String (format: "%03d", y)
-            let cstr = String (format: "%03d", debugBuffer._lines.debugGetCyclicIndex(y))
+            let istr = String(y).leftPadding(toLength: 3, withPad: "0")
+            let cstr = String(debugBuffer._lines.debugGetCyclicIndex(y)).leftPadding(toLength: 3, withPad: "0")
         
             print ("[\(istr):\(cstr)]\(flag)\(yb) \(debugBuffer._lines.getArray() [y].debugDescription)")
         }
     }    
+#endif
 }

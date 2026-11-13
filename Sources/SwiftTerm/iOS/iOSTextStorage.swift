@@ -1,4 +1,6 @@
+#if !SWIFTTERM_EMBEDDED
 import Foundation
+
 #if canImport(UIKit)
 import UIKit
 
@@ -7,6 +9,7 @@ import UIKit
     These are not part of the public API, but are used internally.
 */
 class TextPosition: UITextPosition {
+  // UITextInput communicates text ranges with NSRange-style UTF-16 offsets.
   let offset: Int
   
   init(offset: Int) {
@@ -40,7 +43,7 @@ class TextRange: UITextRange {
   init(from: TextPosition, maxOffset: Int, in baseString: String) {
     if maxOffset >= 0 {
       self.startPosition = from
-      let end = min(baseString.count, from.offset + maxOffset)
+      let end = min(baseString.textInputUTF16Count, from.offset + maxOffset)
       self.endPosition = TextPosition(offset: end)
     } else {
       self.endPosition = from
@@ -62,9 +65,7 @@ class TextRange: UITextRange {
   }
   
   func fullRange(in baseString: String) -> Range<String.Index> {
-    let beginIndex = baseString.index(baseString.startIndex, offsetBy: startPosition.offset)
-    let endIndex = baseString.index(beginIndex, offsetBy: endPosition.offset - startPosition.offset)
-    return beginIndex..<endIndex
+    return baseString.textInputRange(startUTF16Offset: startPosition.offset, endUTF16Offset: endPosition.offset)
   }
   
   var length: Int {
@@ -106,7 +107,9 @@ class TextSelectionRect: UITextSelectionRect {
   init(rect: CGRect, range: TextRange, string: String) {
     _rect = rect
     _containsStart = range.startPosition.offset == 0
-    _containsEnd = range.endPosition.offset == string.count
+    _containsEnd = range.endPosition.offset == string.textInputUTF16Count
   }
 }
 #endif
+
+#endif // !SWIFTTERM_EMBEDDED

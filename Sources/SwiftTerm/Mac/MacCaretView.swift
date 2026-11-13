@@ -7,6 +7,7 @@
 //  Created by Miguel de Icaza on 3/20/20.
 //
 
+#if !SWIFTTERM_EMBEDDED
 #if os(macOS)
 import Foundation
 import AppKit
@@ -15,32 +16,70 @@ import CoreGraphics
 import CoreText
 
 // The CaretView is used to show the cursor
-class CaretView: NSView, CALayerDelegate {
-    weak var terminal: TerminalView?
+class CaretView: NSView {
+    weak var terminal: (any CaretHost)?
     var ctline: CTLine?
+    /// Cell width of the character currently under the caret (2 for full-width
+    /// CJK). Used to center its glyph within the caret, matching the text.
+    var glyphColumnWidth: Int = 1
+    var powerlineRenderMode: BufferLine.RenderLineMode = .single
+    var powerlineCodePoint: UInt32?
+    var renderCursorColor = NSColor.selectedControlColor
+    var renderTextColor = NSColor.black
+    var renderCustomBlockGlyphs = true
+    var renderNormalFont: NSFont?
     var bgColor: CGColor
-    var tracksFocus = true
+    var tracksFocus = true {
+        didSet {
+            updateCursorStyle()
+        }
+    }
     
-    public init (frame: CGRect, cursorStyle: CursorStyle, terminal: TerminalView)
+    init (frame: CGRect, cursorStyle: CursorStyle, terminal: any CaretHost)
     {
         self.terminal = terminal
         style = cursorStyle
         bgColor = caretColor.cgColor
         super.init(frame: frame)
         wantsLayer = true
-        
+
         updateView()
     }
-    
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    // Enable transparency support for the cursor (matches iOS behavior)
+    override func makeBackingLayer() -> CALayer {
+        let layer = super.makeBackingLayer()
+        layer.isOpaque = false
+        layer.backgroundColor = NSColor.clear.cgColor
+        return layer
+    }
     
-    func setText (ch: CharData) {
-        let character = terminal?.terminal.getCharacter(for: ch) ?? " "
+    func setText (_ data: CaretRenderData) {
+        glyphColumnWidth = max(1, Int(data.width))
+        renderCursorColor = data.cursorColor
+        renderTextColor = data.textColor
+        renderCustomBlockGlyphs = data.customBlockGlyphs
+        renderNormalFont = data.normalFont
+        let hideText = data.cellAttribute.style.contains(.invisible)
+            || (!data.textBlinkVisible && data.cellAttribute.style.contains(.blink))
+        if hideText {
+            powerlineCodePoint = nil
+        } else {
+            powerlineCodePoint = PowerlineRenderer.glyph(for: UInt32(data.code)) == nil
+                ? nil : UInt32(data.code)
+        }
+        let character = hideText ? " " : data.character
+        // A host glyph fallback carries an explicit font; appending a
+        // variation selector would only fight it.
+        let usesGlyphFallback = data.attributes[SwiftTermGlyphPolicyKey] != nil
         let res = NSAttributedString (
-            string: String (character),
-            attributes: terminal?.getAttributedValue(ch.attribute, usingFg: caretColor, andBg: caretTextColor ?? terminal?.nativeForegroundColor ?? NSColor.black))
+            string: usesGlyphFallback ? String (character)
+                                      : UnicodeUtil.textPresentationAdjusted (character),
+            attributes: data.attributes)
         ctline = CTLineCreateWithAttributedString(res)
 
         setNeedsDisplay(bounds)
@@ -53,9 +92,10 @@ class CaretView: NSView, CALayerDelegate {
     }
     
     func updateCursorStyle () {
+        let canBlink = !tracksFocus || (terminal?.hasFocus ?? true)
         switch style {
         case .blinkUnderline, .blinkBlock, .blinkBar:
-            updateAnimation(to: true)
+            updateAnimation(to: canBlink)
         case .steadyBar, .steadyBlock, .steadyUnderline:
             updateAnimation(to: false)
         }
@@ -73,13 +113,40 @@ class CaretView: NSView, CALayerDelegate {
             anim.fromValue = NSNumber (floatLiteral: 1)
             anim.toValue = NSNumber (floatLiteral: 0)
             anim.timingFunction = CAMediaTimingFunction (name: .easeIn)
+            // The CA opacity animation is self-driving: the caret blinks with
+            // no frame ticks needed, so it deliberately does NOT touch the
+            // FrameDriver (an idle focused terminal should pause the link).
             layer?.add(anim, forKey: #keyPath (CALayer.opacity))
         }
     }
-    
+
     func disableAnimations () {
         layer?.removeAllAnimations()
         layer?.opacity = 1
+    }
+
+    /// Makes the cursor visible now and delays the next blink cycle. Repeated
+    /// input therefore keeps the cursor visible until typing pauses.
+    func resetBlinkAfterInput () {
+        let canBlink = !tracksFocus || (terminal?.hasFocus ?? true)
+        guard canBlink else { return }
+        switch style {
+        case .blinkUnderline, .blinkBlock, .blinkBar:
+            layer?.removeAllAnimations()
+            layer?.opacity = 1
+            guard let layer else { return }
+            let anim = CABasicAnimation(keyPath: #keyPath(CALayer.opacity))
+            anim.duration = 0.7
+            anim.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + 0.7
+            anim.autoreverses = true
+            anim.repeatCount = .infinity
+            anim.fromValue = 1
+            anim.toValue = 0
+            anim.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            layer.add(anim, forKey: #keyPath(CALayer.opacity))
+        case .steadyBar, .steadyBlock, .steadyUnderline:
+            break
+        }
     }
     
     public var defaultCaretColor = NSColor.selectedControlColor
@@ -100,16 +167,12 @@ class CaretView: NSView, CALayerDelegate {
 
     public var focused: Bool = false {
         didSet {
-            updateView()
+            updateCursorStyle()
         }
     }
 
     func updateView() {
         setNeedsDisplay(bounds)
-    }
-    
-    func draw(_ layer: CALayer, in context: CGContext) {
-        drawCursor (in: context, hasFocus: tracksFocus ? (terminal?.hasFocus ?? true) : true)
     }
     
     override func draw(_ dirtyRect: NSRect) {
@@ -120,4 +183,12 @@ class CaretView: NSView, CALayerDelegate {
         return nil
     }
 }
+
+extension CaretView: @MainActor CALayerDelegate {
+    func draw(_ layer: CALayer, in context: CGContext) {
+        drawCursor(in: context, hasFocus: tracksFocus ? (terminal?.hasFocus ?? true) : true)
+    }
+}
 #endif
+
+#endif // !SWIFTTERM_EMBEDDED

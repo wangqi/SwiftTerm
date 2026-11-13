@@ -1,3 +1,4 @@
+#if !SWIFTTERM_EMBEDDED
 #if os(macOS) || os(iOS) || os(visionOS)
 import CoreGraphics
 import Foundation
@@ -98,7 +99,10 @@ struct BlockElementMapping {
 struct BlockElementRenderItem {
     let column: Int
     let columnWidth: Int
+    let codePoint: UInt32
     let rects: [BlockElementRect]
     let foregroundColor: TTColor
 }
 #endif
+
+#endif // !SWIFTTERM_EMBEDDED

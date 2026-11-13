@@ -16,6 +16,33 @@ final class SgrTests {
         #expect(cell.attribute.style.contains(.underline))
     }
 
+    @Test func testCombinedSgrKeepsFinalStyleAndResetOrder() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 8, rows: 1)
+        let combined = "\(esc)[0;1;3;4;38;2;10;20;30;48;5;200m"
+        terminal.feed(text: "\(esc)[31mA\(combined)BC\(combined)D\(esc)[1;0mE\(esc)[1m\(esc)[mF")
+
+        let original = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 0)
+        let styled = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 1)
+        let repeated = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 3)
+        let reset = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 4)
+        let emptyReset = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 5)
+        #expect(original?.attribute.fg == .ansi256(code: 1))
+        #expect(styled?.attribute == TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 2)?.attribute)
+        #expect(styled?.attribute == repeated?.attribute)
+        #expect(styled?.attribute.style.contains([.bold, .italic, .underline]) == true)
+        #expect(styled?.attribute.fg == .trueColor(red: 10, green: 20, blue: 30))
+        #expect(styled?.attribute.bg == .ansi256(code: 200))
+        #expect(reset?.attribute == CharData.defaultAttr)
+        #expect(emptyReset?.attribute == CharData.defaultAttr)
+    }
+
+    @Test func testLongCombinedSgrUsesLastReset() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 5, rows: 1)
+        terminal.feed(text: "\(esc)[4:3;38;2;51;51;51;48;2;170;170;170;58;2;255;97;136;0mX")
+        let cell = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 0)
+        #expect(cell?.attribute == CharData.defaultAttr)
+    }
+
     @Test func testResetBold() {
         let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 5, rows: 1)
         terminal.feed(text: "\(esc)[1mX\(esc)[22mY")
@@ -70,6 +97,66 @@ final class SgrTests {
         #expect(cell != nil)
         guard let cell else { return }
         #expect(cell.attribute.fg == .trueColor(red: 10, green: 20, blue: 30))
+    }
+
+    @Test func testMixedColorSeparatorsRemainDistinct() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 5, rows: 1)
+        terminal.feed(text: "\(esc)[38:2::10:20:30;48;2;4;5;6;1mX\(esc)[4:3;31mY")
+
+        let mixed = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 0)
+        #expect(mixed?.attribute.fg == .trueColor(red: 10, green: 20, blue: 30))
+        #expect(mixed?.attribute.bg == .trueColor(red: 4, green: 5, blue: 6))
+        #expect(mixed?.attribute.style.contains(.bold) == true)
+
+        let underline = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 1)
+        #expect(underline?.attribute.fg == .ansi256(code: 1))
+        #expect(underline?.attribute.underlineStyle == .curly)
+    }
+
+    @Test func testColonSeparatorsSurviveChunkedInput() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 5, rows: 1)
+        terminal.feed(text: "\(esc)[38:2::10:")
+        terminal.feed(text: "20:30;48;5;100mX")
+
+        let cell = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 0)
+        #expect(cell?.attribute.fg == .trueColor(red: 10, green: 20, blue: 30))
+        #expect(cell?.attribute.bg == .ansi256(code: 100))
+    }
+
+    @Test func testSgrParameterLimitAndOversizedMixedSequence() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 5, rows: 1)
+        let accepted = Array(repeating: "0", count: 23) + ["31"]
+        terminal.feed(text: "\(esc)[\(accepted.joined(separator: ";"))mX")
+
+        let acceptedCell = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 0)
+        #expect(acceptedCell?.attribute.fg == .ansi256(code: 1))
+
+        terminal.feed(text: "\(esc)[1m")
+        let oversizedPrefix = Array(repeating: "0", count: 65).joined(separator: ";")
+        terminal.feed(text: "\(esc)[\(oversizedPrefix);38:2::1:2:3mY")
+
+        let droppedCell = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: 1)
+        #expect(droppedCell?.attribute.style.contains(.bold) == true)
+        #expect(droppedCell?.attribute.fg == .ansi256(code: 1))
+    }
+
+    @Test func testRepeatedSgrAndSameBackgroundKeepEraseState() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal(cols: 5, rows: 1)
+        terminal.feed(text: "\(esc)[44m\(esc)[44mABCDE")
+        terminal.feed(text: "\r\(esc)[31;4m\(esc)[2X")
+
+        for column in 0..<2 {
+            let erased = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: column)
+            #expect(erased?.attribute.fg == CharData.defaultAttr.fg)
+            #expect(erased?.attribute.bg == .ansi256(code: 4))
+            #expect(erased?.attribute.style == CharacterStyle.none)
+        }
+
+        terminal.feed(text: "\r\(esc)[42m\(esc)[2X")
+        for column in 0..<2 {
+            let erased = TerminalTestHarness.charData(buffer: terminal.buffer, row: 0, col: column)
+            #expect(erased?.attribute.bg == .ansi256(code: 2))
+        }
     }
 
     @Test func testUnderlineColorSetAndReset() {

@@ -6,40 +6,162 @@
 //  Copyright © 2020 Miguel de Icaza. All rights reserved.
 //
 
+#if !SWIFTTERM_EMBEDDED
 import Foundation
+#endif
 
 /// Configuration option for the desired cursor style, this style can also be overwritten by the application
 /// inside the terminal, and the UI control can choose to honor this request.
-public enum CursorStyle {
+public enum CursorStyle: CaseIterable, Sendable {
     case blinkBlock
     case steadyBlock
     case blinkUnderline
     case steadyUnderline
     case blinkBar
     case steadyBar
-    
-    public static func from (string: String) -> CursorStyle? {
-        switch string {
-        case "blinkBlock":
-            return .blinkBlock
-        case "steadyBlock":
-            return .steadyBlock
-        case "blinkUnderline":
-            return .blinkUnderline
-        case "steadyUnderline":
-            return .steadyUnderline
-        case "blinkBar":
-            return .blinkBar
-        case "steadyBar":
-            return .steadyBar
-        default:
+
+    // Beyond CaseIterable, the declaration deliberately gains no protocol
+    // conformances (Codable, CustomStringConvertible...): clients may have
+    // added those retroactively, and a library-provided conformance would
+    // collide with theirs. Only members are added below.
+
+    /// A stable, machine-readable name for the style, suitable for persisting
+    /// settings; the inverse of ``init(tagName:)``
+    public var tagName: String {
+        switch self {
+        case .blinkBlock: return "blinkBlock"
+        case .steadyBlock: return "steadyBlock"
+        case .blinkUnderline: return "blinkUnderline"
+        case .steadyUnderline: return "steadyUnderline"
+        case .blinkBar: return "blinkBar"
+        case .steadyBar: return "steadyBar"
+        }
+    }
+
+    /// A human-readable name for the style, for use in user interfaces
+    public var displayName: String {
+        switch self {
+        case .blinkBlock: return "Blinking Block"
+        case .steadyBlock: return "Steady Block"
+        case .blinkUnderline: return "Blinking Underline"
+        case .steadyUnderline: return "Steady Underline"
+        case .blinkBar: return "Blinking Bar"
+        case .steadyBar: return "Steady Bar"
+        }
+    }
+
+    /// Creates a cursor style from the stable name returned by ``tagName``
+    public init? (tagName: String) {
+        guard let match = CursorStyle.allCases.first (where: { $0.tagName == tagName }) else {
             return nil
+        }
+        self = match
+    }
+
+    public static func from (string: String) -> CursorStyle? {
+        return CursorStyle (tagName: string)
+    }
+
+    var decscusrParameter: Int {
+        switch self {
+        case .blinkBlock: return 1
+        case .steadyBlock: return 2
+        case .blinkUnderline: return 3
+        case .steadyUnderline: return 4
+        case .blinkBar: return 5
+        case .steadyBar: return 6
         }
     }
 }
 
+/// Width to assign to individual (unpaired) Regional Indicator symbols (U+1F1E6–U+1F1FF).
+/// Combined flag pairs (e.g. 🇺🇸) are always rendered as width 2 regardless of this setting.
+public enum RegionalIndicatorWidth: Sendable {
+    /// Width 2: matches kitty, Ghostty, iTerm2, and the Python wcwidth >= 0.5.2 library.
+    /// This is the default and preserves SwiftTerm's existing behavior.
+    case wide
+    /// Width 1: matches system wcwidth() on macOS/Linux, Alacritty, WezTerm, Windows Terminal,
+    /// and the Unicode East Asian Width property (Neutral). Use this when running inside tmux
+    /// or other multiplexers that use wcwidth() for cursor positioning.
+    case narrow
+}
+
+/// Configuration for the Kitty graphics protocol.
+///
+/// The default configuration permits direct payloads only. Keep local media
+/// disabled for a remote or untrusted session. For security considerations,
+/// see <doc:KittyGraphicsIntegration>.
+public struct KittyGraphicsConfiguration: Sendable, Equatable {
+    /// Local transmission media that a terminal instance accepts.
+    public struct LocalMediaPolicy: OptionSet, Sendable, Equatable {
+        public let rawValue: UInt8
+
+        public init(rawValue: UInt8) {
+            self.rawValue = rawValue
+        }
+
+        /// Permit `t=f` regular-file transmission.
+        public static let regularFiles = LocalMediaPolicy(rawValue: 1 << 0)
+        /// Permit `t=t` temporary-file transmission.
+        public static let temporaryFiles = LocalMediaPolicy(rawValue: 1 << 1)
+        /// Permit `t=s` POSIX shared-memory transmission.
+        public static let sharedMemory = LocalMediaPolicy(rawValue: 1 << 2)
+        /// Permit all local transmission media.
+        public static let all: LocalMediaPolicy = [.regularFiles, .temporaryFiles, .sharedMemory]
+    }
+
+    /// Maximum decoded bytes stored independently on each screen.
+    ///
+    /// A value of zero disables the protocol, including query responses.
+    public var storageLimitBytesPerScreen: UInt32
+    /// Local transmission media that the host permits. Direct payloads do not need permission.
+    public var localMediaPolicy: LocalMediaPolicy
+    /// A trusted directory for `t=t` temporary files.
+    ///
+    /// Temporary-file transmission is rejected when this value is `nil`.
+    public var trustedTemporaryDirectory: TerminalTemporaryDirectory? {
+        get { trustedTemporaryDirectoryBox?.value }
+        set { trustedTemporaryDirectoryBox = newValue.map(TemporaryDirectoryBox.init) }
+    }
+
+    /// `URL` is a resilient Foundation type, so its size is known only at run
+    /// time. Stored inline, it gives this struct, `TerminalOptions`, and
+    /// `Terminal` a run-time layout, and each `Terminal` field read after
+    /// `_options` must first load its offset. A reference has a fixed size.
+    private var trustedTemporaryDirectoryBox: TemporaryDirectoryBox?
+
+    private final class TemporaryDirectoryBox: Sendable {
+        let value: TerminalTemporaryDirectory
+        init(_ value: TerminalTemporaryDirectory) { self.value = value }
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.storageLimitBytesPerScreen == rhs.storageLimitBytesPerScreen
+            && lhs.localMediaPolicy == rhs.localMediaPolicy
+            && lhs.trustedTemporaryDirectory == rhs.trustedTemporaryDirectory
+    }
+
+    /// Creates a Kitty graphics configuration.
+    ///
+    /// - Parameters:
+    ///   - storageLimitBytesPerScreen: The decoded byte limit for each screen.
+    ///     A value of zero disables the protocol.
+    ///   - localMediaPolicy: The local transmission media to accept.
+    ///   - trustedTemporaryDirectory: The directory for temporary-file
+    ///     transmission.
+    public init(
+        storageLimitBytesPerScreen: UInt32 = 10_000_000,
+        localMediaPolicy: LocalMediaPolicy = [],
+        trustedTemporaryDirectory: TerminalTemporaryDirectory? = nil
+    ) {
+        self.storageLimitBytesPerScreen = storageLimitBytesPerScreen
+        self.localMediaPolicy = localMediaPolicy
+        self.trustedTemporaryDirectory = trustedTemporaryDirectory
+    }
+}
+
 /// Configuration options for the terminal at startup, these values are only read at startup
-public struct TerminalOptions {
+public struct TerminalOptions: Sendable {
     /// Desired number of columns at startup (default 80)
     public var cols: Int
     /// Desired number of rows at startup (default 25)
@@ -58,11 +180,75 @@ public struct TerminalOptions {
     public var tabStopWidth: Int
     /// Whether to report that sixel support is present
     public var enableSixelReported:Bool
-    /// Maximum total bytes to keep for kitty image data; defaults to 320MB and is clamped to 4GB.
-    public var kittyImageCacheLimitBytes: Int
+    /// Kitty graphics protocol policy and per-screen storage limit.
+    public var kittyGraphics: KittyGraphicsConfiguration
     /// Strategy used to derive the 256-color palette from the base 16 colors.
     public var ansi256PaletteStrategy: Ansi256PaletteStrategy
-    
+    /// Width for individual Regional Indicator symbols. `.wide` (default) preserves existing
+    /// behavior. `.narrow` matches system wcwidth() and avoids cursor divergence with tmux.
+    public var regionalIndicatorWidth: RegionalIndicatorWidth
+    /// BiDi state for new paragraphs after startup or reset.
+    public var initialBidiState: BidiPresentationState
+    /// Maximum rows that the renderer processes as one BiDi paragraph.
+    public var maximumBidiParagraphRows: Int
+    /// Initial state for terminal-wg left and right arrow swapping. The default
+    /// is false, so the host or terminal application must opt in.
+    public var initialBidiArrowKeySwap: Bool
+    /// An ASCII-alphanumeric iTerm2 feature report. Nil disables reporting.
+    /// The host must include only features that the terminal and host implement together.
+    public var featureReport: String?
+    /// Maximum bytes accepted for one OSC sequence.
+    /// Lower this limit to reduce memory exposure to untrusted OSC 1337 or OSC 52 payloads.
+    public var maximumOscBytes: Int
+    /// Accept OSC 8 hyperlinks. The default is true.
+    /// Set this to false to keep implicit URL and path detection only.
+    public var enableOsc8Hyperlinks: Bool
+    /// Answer DECRQCRA (Request Checksum of Rectangular Area, `CSI Pi ; Pg ; Pt ; Pl ; Pb ; Pr * y`)
+    /// with the real checksum of the screen contents.
+    ///
+    /// DECRQCRA lets the application that runs in the terminal read back the screen.
+    /// A program can request the checksum of each cell, one at a time, and get the
+    /// text on the screen. This is a screen-scraping channel: it can expose text
+    /// that a different program wrote, for example output from before an `ssh`
+    /// session started, or a password prompt that echoes input.
+    ///
+    /// When this is false, the terminal answers each request with a checksum of
+    /// zero, so an application that waits for a response does not stop.
+    /// Test suites such as esctest and vttest use DECRQCRA to examine the screen.
+    ///
+    /// The default is true in debug builds and false in release builds.
+    /// The ``TerminalDelegate/isProcessTrusted(source:)`` check also applies.
+    public var enableRectangularAreaChecksum: Bool
+    /// Host policy for the Kitty clipboard protocol. Capabilities are still explicit.
+    ///
+    /// The default is empty, so a host must opt in. Mode 5522 is reported as
+    /// supported only when this contains both ``KittyClipboardPolicy/read`` and
+    /// ``KittyClipboardPolicy/write`` and the host offers the matching services.
+    public var kittyClipboardPolicy: KittyClipboardPolicy
+    /// Maximum decoded bytes in one Kitty clipboard write transaction.
+    ///
+    /// The protocol requires at least 64 MiB, so a smaller value reads back
+    /// as 64 MiB. The floor applies to assignment as well as to the initializer.
+    public var kittyClipboardWriteLimitBytes: Int {
+        get { max(Self.minimumKittyClipboardWriteLimitBytes, storedKittyClipboardWriteLimitBytes) }
+        set { storedKittyClipboardWriteLimitBytes = newValue }
+    }
+    /// Maximum representations in one Kitty clipboard write transaction.
+    /// Exceeding it answers `EFBIG` and discards the transaction. The floor is 1.
+    public var kittyClipboardMaximumRepresentations: Int {
+        get { max(1, storedKittyClipboardMaximumRepresentations) }
+        set { storedKittyClipboardMaximumRepresentations = newValue }
+    }
+    /// Maximum aliases in one Kitty clipboard write transaction.
+    /// Exceeding it answers `EFBIG` and discards the transaction. The floor is 0.
+    public var kittyClipboardMaximumAliases: Int {
+        get { max(0, storedKittyClipboardMaximumAliases) }
+        set { storedKittyClipboardMaximumAliases = newValue }
+    }
+    private var storedKittyClipboardWriteLimitBytes: Int
+    private var storedKittyClipboardMaximumRepresentations: Int
+    private var storedKittyClipboardMaximumAliases: Int
+
     /// Default options
     public static let `default` = TerminalOptions.init(cols: 80,
                                                        rows: 25,
@@ -73,11 +259,44 @@ public struct TerminalOptions {
                                                        scrollback: 500,
                                                        tabStopWidth: 8,
                                                        enableSixelReported: true,
-                                                       kittyImageCacheLimitBytes: 320 * 1024 * 1024,
-                                                       ansi256PaletteStrategy: .base16Lab)
+                                                       kittyGraphics: KittyGraphicsConfiguration(),
+                                                       ansi256PaletteStrategy: .base16Lab,
+                                                       regionalIndicatorWidth: .wide,
+                                                       initialBidiState: .default,
+                                                       maximumBidiParagraphRows: 500,
+                                                       initialBidiArrowKeySwap: false,
+                                                       featureReport: nil,
+                                                       maximumOscBytes: 65 * 1024 * 1024,
+                                                       kittyClipboardPolicy: [],
+                                                       kittyClipboardWriteLimitBytes: TerminalOptions.minimumKittyClipboardWriteLimitBytes,
+                                                       kittyClipboardMaximumRepresentations: 256,
+                                                       kittyClipboardMaximumAliases: 256,
+                                                       enableOsc8Hyperlinks: true,
+                                                       enableRectangularAreaChecksum: TerminalOptions.defaultEnableRectangularAreaChecksum)
+
+    #if DEBUG
+    static let defaultEnableRectangularAreaChecksum = true
+    #else
+    static let defaultEnableRectangularAreaChecksum = false
+    #endif
+
+    /// The smallest decoded write-transaction limit that the protocol permits.
+    public static let minimumKittyClipboardWriteLimitBytes = 64 * 1024 * 1024
 
   public init(cols: Int = Self.default.cols, rows: Int = Self.default.rows, convertEol: Bool = Self.default.convertEol, termName: String = Self.default.termName, cursorStyle: CursorStyle = Self.default.cursorStyle, screenReaderMode: Bool = Self.default.screenReaderMode, scrollback: Int = Self.default.scrollback, tabStopWidth: Int = Self.default.tabStopWidth,
-              enableSixelReported: Bool = Self.default.enableSixelReported, kittyImageCacheLimitBytes: Int = Self.default.kittyImageCacheLimitBytes, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy) {
+              enableSixelReported: Bool = Self.default.enableSixelReported, kittyGraphics: KittyGraphicsConfiguration = Self.default.kittyGraphics, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
+              regionalIndicatorWidth: RegionalIndicatorWidth = Self.default.regionalIndicatorWidth,
+              initialBidiState: BidiPresentationState = Self.default.initialBidiState,
+              maximumBidiParagraphRows: Int = Self.default.maximumBidiParagraphRows,
+              initialBidiArrowKeySwap: Bool = Self.default.initialBidiArrowKeySwap,
+              featureReport: String? = Self.default.featureReport,
+              maximumOscBytes: Int = Self.default.maximumOscBytes,
+              kittyClipboardPolicy: KittyClipboardPolicy = Self.default.kittyClipboardPolicy,
+              kittyClipboardWriteLimitBytes: Int = Self.default.kittyClipboardWriteLimitBytes,
+              kittyClipboardMaximumRepresentations: Int = Self.default.kittyClipboardMaximumRepresentations,
+              kittyClipboardMaximumAliases: Int = Self.default.kittyClipboardMaximumAliases,
+              enableOsc8Hyperlinks: Bool = Self.default.enableOsc8Hyperlinks,
+              enableRectangularAreaChecksum: Bool = Self.default.enableRectangularAreaChecksum) {
         self.cols = cols
         self.rows = rows
         self.convertEol = convertEol
@@ -87,7 +306,68 @@ public struct TerminalOptions {
         self.scrollback = scrollback
         self.tabStopWidth = tabStopWidth
         self.enableSixelReported = enableSixelReported
-        self.kittyImageCacheLimitBytes = kittyImageCacheLimitBytes
+        self.kittyGraphics = kittyGraphics
         self.ansi256PaletteStrategy = ansi256PaletteStrategy
+        self.regionalIndicatorWidth = regionalIndicatorWidth
+        self.initialBidiState = initialBidiState
+        self.maximumBidiParagraphRows = max(1, maximumBidiParagraphRows)
+        self.initialBidiArrowKeySwap = initialBidiArrowKeySwap
+        self.featureReport = featureReport
+        self.maximumOscBytes = maximumOscBytes
+        self.enableOsc8Hyperlinks = enableOsc8Hyperlinks
+        self.enableRectangularAreaChecksum = enableRectangularAreaChecksum
+        self.kittyClipboardPolicy = kittyClipboardPolicy
+        // The accessors apply the floors, so one rule covers init and assignment.
+        self.storedKittyClipboardWriteLimitBytes = kittyClipboardWriteLimitBytes
+        self.storedKittyClipboardMaximumRepresentations = kittyClipboardMaximumRepresentations
+        self.storedKittyClipboardMaximumAliases = kittyClipboardMaximumAliases
+    }
+}
+
+extension TerminalOptions {
+    /// The Kitty graphics storage limit, which is now part of ``kittyGraphics``.
+    ///
+    /// Two things changed with the move. The limit counts each screen on its
+    /// own instead of the two together, and its default is much lower. Local
+    /// transmission media (`t=f`, `t=t` and `t=s`) are also off until the host
+    /// permits them through ``KittyGraphicsConfiguration/localMediaPolicy``,
+    /// which this property cannot express.
+    @available(*, deprecated,
+               message: "Use kittyGraphics.storageLimitBytesPerScreen. The limit is now per screen, and local transmission media need kittyGraphics.localMediaPolicy.")
+    public var kittyImageCacheLimitBytes: Int {
+        get { Int(kittyGraphics.storageLimitBytesPerScreen) }
+        set { kittyGraphics.storageLimitBytesPerScreen = UInt32(clamping: max(0, newValue)) }
+    }
+
+    /// Compatibility initializer for hosts that set `kittyImageCacheLimitBytes`.
+    @available(*, deprecated,
+               message: "Use init(kittyGraphics:). Local transmission media need kittyGraphics.localMediaPolicy.")
+    public init(cols: Int = Self.default.cols, rows: Int = Self.default.rows,
+                convertEol: Bool = Self.default.convertEol,
+                termName: String = Self.default.termName,
+                cursorStyle: CursorStyle = Self.default.cursorStyle,
+                screenReaderMode: Bool = Self.default.screenReaderMode,
+                scrollback: Int = Self.default.scrollback,
+                tabStopWidth: Int = Self.default.tabStopWidth,
+                enableSixelReported: Bool = Self.default.enableSixelReported,
+                kittyImageCacheLimitBytes: Int,
+                ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
+                regionalIndicatorWidth: RegionalIndicatorWidth = Self.default.regionalIndicatorWidth,
+                initialBidiState: BidiPresentationState = Self.default.initialBidiState,
+                maximumBidiParagraphRows: Int = Self.default.maximumBidiParagraphRows,
+                initialBidiArrowKeySwap: Bool = Self.default.initialBidiArrowKeySwap,
+                featureReport: String? = Self.default.featureReport) {
+        self.init(cols: cols, rows: rows, convertEol: convertEol, termName: termName,
+                  cursorStyle: cursorStyle, screenReaderMode: screenReaderMode,
+                  scrollback: scrollback, tabStopWidth: tabStopWidth,
+                  enableSixelReported: enableSixelReported,
+                  kittyGraphics: KittyGraphicsConfiguration(
+                    storageLimitBytesPerScreen: UInt32(clamping: max(0, kittyImageCacheLimitBytes))),
+                  ansi256PaletteStrategy: ansi256PaletteStrategy,
+                  regionalIndicatorWidth: regionalIndicatorWidth,
+                  initialBidiState: initialBidiState,
+                  maximumBidiParagraphRows: maximumBidiParagraphRows,
+                  initialBidiArrowKeySwap: initialBidiArrowKeySwap,
+                  featureReport: featureReport)
     }
 }
