@@ -844,6 +844,27 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
           }
     }
     
+    // A public lookup of the link under a view point, so a host app can offer "Open Link" in the long-press menu: on
+    // a touch screen there is no hover, so a tap never opens a detected (implicit) link. Uses SwiftTerm's own link
+    // detection (explicit OSC 8 first, then implicit, wrapped lines included), ignoring the highlight mode.
+    // wangqi modified 2026-11-13
+    /// The link at `point` (view coordinates), explicit (OSC 8) or detected in the text, or nil.
+    public func linkRequest(at point: CGPoint) -> TerminalLinkRequest?
+    {
+        withTerminal { terminal in
+            let position = calculateTapHitLocked(point: point).grid
+            guard let match = terminal.linkMatch(at: .buffer(position), mode: .explicitAndImplicit) else {
+                return nil
+            }
+            if match.isExplicit,
+               let payload = payloadStringLocked(at: position),
+               let (url, params) = urlAndParamsFrom(payload: payload) {
+                return TerminalLinkRequest(link: url, params: params, isExplicit: true)
+            }
+            return TerminalLinkRequest(link: match.text, params: [:], isExplicit: match.isExplicit)
+        }
+    }
+
     /// This controls whether the backspace should send ^? or ^H, the default is ^?
     /// The backspace key also sends ^H while the application sets DECBKM (`CSI ? 67 h`).
     public var backspaceSendsControlH: Bool = false
